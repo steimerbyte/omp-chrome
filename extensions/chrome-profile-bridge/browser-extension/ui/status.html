@@ -547,8 +547,11 @@
     }
     fetchOnce();
     connect();
-    setInterval(() => { if (lastSnapshot) render(lastSnapshot); }, 1000);
-
+    // Diagnostic: surface the popup's loaded version so the user can confirm the latest
+    // status.html is in their popup cache. Falls back to '?' if chrome.runtime is missing.
+    try {
+      $("ver").textContent = chrome.runtime.getManifest().version;
+    } catch {}
     $("copy").addEventListener("click", async () => {
       const s = lastSnapshot || {};
       const text = [
