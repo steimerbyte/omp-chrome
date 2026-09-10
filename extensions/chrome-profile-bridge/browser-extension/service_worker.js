@@ -234,21 +234,17 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   for (const t of automationTargets.values()) if (t.tabId === tabId) return true;
   return false;
 }
-// Initial URL for automation targets. The lone URL scheme that chrome.scripting.executeScript
-// and chrome.debugger.attach can both reach: a real http(s) URL on an origin covered by
-// manifest host_permissions, or our own extension origin (`chrome-extension://<id>/...`),
-// which Chrome grants script-injection access to by default. We use the extension origin so
-// no extra bridge route is required and the URL is self-contained: it survives bridge
-// renames, multi-port installs, and bridge mode switches (server / client / promote). About:
-// blank is unusable (host_permissions cannot cover about: — Chrome treats it as opaque).
-// Data: URLs are unusable too (chrome.scripting rejects them even with `<all_urls>` because
-// data: has no extension access for injection). Chrome: / chrome-extension: / devtools:
-// (other than our own) are also blocked by host_permissions. ui/automation-shell.html is a
-// minimal `text/html` page with a `<title>Pi Chrome</title>` shell — chrome_snapshot uses the
-// title to label the tab and chrome_inspect / chrome_click attach to the live document.
-const AUTOMATION_TARGET_URL = (chrome.runtime && typeof chrome.runtime.getURL === "function")
-  ? chrome.runtime.getURL("ui/automation-shell.html")
-  : `${BRIDGE_URL}/__pi_chrome_shell`;
+// Initial URL for automation targets. Must be a real http(s) URL on an origin covered by
+// manifest host_permissions. We use the bridge origin itself (`http://127.0.0.1:17318`) which
+// the companion already trusts and which the bridge serves as a tiny `text/html` page with a
+// `<title>Pi Chrome</title>` shell. About:blank is unusable (host_permissions cannot cover
+// about: — Chrome treats it as opaque). Data: URLs are unusable too (chrome.scripting rejects
+// them even with `<all_urls>` because data: has no extension access for injection).
+// Chrome-extension: URLs (our own origin) are also rejected by chrome.scripting unless the
+// user has just interacted with the tab (activeTab flow). Chrome: / devtools: / edge: are
+// likewise blocked. The bridge route is the only universal option that does not require a
+// user click or a specific external page.
+const AUTOMATION_TARGET_URL = `${BRIDGE_URL}/__pi_chrome_shell`;
 
 async function createAutomationTarget(sessionKey, groupTitle) {
 	const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;

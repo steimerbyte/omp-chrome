@@ -4,182 +4,522 @@
 <meta charset="utf-8" />
 <title>Pi Chrome Connector</title>
 <style>
+  /* Radix-aligned color tokens (no external font; ship a small bundle). */
   :root {
     color-scheme: dark;
-    --bg: #0b0d12;
-    --panel: #14171f;
-    --border: #2a2f3a;
-    --text: #e6e9ef;
-    --muted: #8a93a6;
-    --green: #16a34a;
-    --yellow: #ca8a04;
-    --red: #dc2626;
-    --grey: #4b5563;
+
+    /* Radix accent + gray scales, dark mode. */
+    --accent-1: hsl(263, 70%, 58%);   /* iris-9 */
+    --accent-2: hsl(258, 90%, 66%);   /* violet-9 */
+    --accent-3: hsl(244, 100%, 69%);  /* indigo-9 */
+    --accent-4: hsl(217, 91%, 60%);   /* blue-9 */
+    --accent-5: hsl(189, 94%, 43%);   /* cyan-9 */
+
+    --bg-1: hsl(230, 16%, 6%);       /* app bg */
+    --bg-2: hsl(230, 14%, 9%);       /* panel */
+    --bg-3: hsl(230, 13%, 12%);      /* panel-elevated */
+
+    --border-1: hsla(230, 12%, 80%, 0.06);
+    --border-2: hsla(230, 12%, 80%, 0.12);
+
+    --text-1: hsl(220, 14%, 96%);
+    --text-2: hsl(220, 10%, 80%);
+    --text-3: hsl(220, 8%, 60%);
+
+    --green-9: hsl(146, 60%, 52%);
+    --green-3: hsla(146, 60%, 52%, 0.18);
+    --amber-9: hsl(38, 92%, 55%);
+    --amber-3: hsla(38, 92%, 55%, 0.18);
+    --red-9:   hsl(358, 75%, 60%);
+    --red-3:   hsla(358, 75%, 60%, 0.18);
+    --grey-9:  hsl(230, 8%, 46%);
+    --grey-3:  hsla(230, 8%, 46%, 0.18);
+
+    --radius-1: 4px;
+    --radius-2: 6px;
+    --radius-3: 8px;
+    --radius-4: 12px;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.4);
+    --shadow-2: 0 4px 16px -2px rgba(0,0,0,0.5), 0 0 0 1px var(--border-1);
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "Inter var", "Inter", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
+
   * { box-sizing: border-box; }
+
   html, body {
     margin: 0;
     padding: 0;
-    width: 320px;
-    background: var(--bg);
-    color: var(--text);
-    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    width: 360px;
+    color: var(--text-1);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
   }
-  header {
-    display: flex;
+
+  body {
+    min-height: 100vh;
+    /* Layered background: deep base + radial accent washes + faint grid optical layer. */
+    background:
+      radial-gradient(circle at 0% 0%, hsla(263, 70%, 58%, 0.18) 0%, transparent 45%),
+      radial-gradient(circle at 100% 100%, hsla(189, 94%, 43%, 0.12) 0%, transparent 50%),
+      var(--bg-1);
+    overflow-x: hidden;
+  }
+
+  /* Optical grid layer — fixed, sits behind everything. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+      linear-gradient(var(--border-1) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border-1) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-position: -1px -1px;
+    mask-image: radial-gradient(ellipse at 50% 30%, black 0%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse at 50% 30%, black 0%, transparent 80%);
+  }
+
+  /* Subtle scanline shimmer that drifts across the popup. */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background: linear-gradient(115deg, transparent 30%, hsla(263, 70%, 58%, 0.04) 50%, transparent 70%);
+    animation: drift 12s linear infinite;
+  }
+
+  @keyframes drift {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .stack {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+  }
+
+  /* ---------------- Header / Status ---------------- */
+
+  .header {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
     align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: var(--radius-4);
+    background:
+      linear-gradient(135deg, hsla(263, 70%, 58%, 0.08), hsla(189, 94%, 43%, 0.04)),
+      var(--bg-2);
+    border: 1px solid var(--border-2);
+    box-shadow: var(--shadow-2);
+    backdrop-filter: blur(8px);
   }
-  .led {
+
+  .led-wrap {
+    position: relative;
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+  }
+
+  .led-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    opacity: 0.5;
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .led-ring.green  { background: var(--green-9); box-shadow: 0 0 12px var(--green-9); }
+  .led-ring.amber  { background: var(--amber-9); box-shadow: 0 0 12px var(--amber-9); }
+  .led-ring.red    { background: var(--red-9);   box-shadow: 0 0 12px var(--red-9);   }
+  .led-ring.grey   { background: var(--grey-9);  box-shadow: 0 0 4px var(--grey-9);   animation: none; opacity: 0.35; }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1);   opacity: 0.45; }
+    50%      { transform: scale(1.5); opacity: 0; }
+  }
+
+  .led-dot {
+    position: relative;
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--grey);
-    flex-shrink: 0;
-    box-shadow: 0 0 0 2px rgba(255,255,255,0.04);
+    z-index: 1;
   }
-  .led.online  { background: var(--green); }
-  .led.auth    { background: var(--yellow); }
-  .led.offline { background: var(--red); }
-  header h1 {
+  .led-dot.green { background: var(--green-9); box-shadow: 0 0 6px var(--green-9); }
+  .led-dot.amber { background: var(--amber-9); box-shadow: 0 0 6px var(--amber-9); }
+  .led-dot.red   { background: var(--red-9);   box-shadow: 0 0 6px var(--red-9); }
+  .led-dot.grey  { background: var(--grey-9); }
+
+  .header h1 {
     margin: 0;
     font-size: 13px;
     font-weight: 600;
-    flex: 1;
+    letter-spacing: -0.01em;
+    color: var(--text-1);
   }
-  header .ver {
+  .header .subtitle {
+    margin: 0;
     font-size: 11px;
-    color: var(--muted);
+    color: var(--text-3);
     font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
   }
-  main {
-    padding: 12px;
-  }
-  .row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: 6px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
-    gap: 8px;
-  }
-  .row:last-child { border-bottom: none; }
-  .label {
-    color: var(--muted);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .value {
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-    text-align: right;
-    word-break: break-all;
-    max-width: 200px;
-  }
-  .value.mono {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
-    font-size: 11px;
-  }
-  .state-online  .value { color: var(--green); }
-  .state-auth    .value { color: var(--yellow); }
-  .state-offline .value { color: var(--red); }
-  .error {
-    background: rgba(220, 38, 38, 0.08);
-    border: 1px solid rgba(220, 38, 38, 0.3);
-    border-radius: 4px;
-    padding: 6px 8px;
-    margin-top: 8px;
-    color: #fca5a5;
-    font-size: 11px;
-    word-break: break-word;
-  }
-  footer {
-    border-top: 1px solid var(--border);
-    padding: 8px 12px;
-    display: flex;
+
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
     gap: 6px;
-    background: var(--panel);
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
   }
-  button {
-    flex: 1;
-    background: #1f242f;
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 6px 8px;
-    font-size: 12px;
-    border-radius: 4px;
+  .state-pill.green {
+    color: var(--green-9);
+    background: var(--green-3);
+    border: 1px solid hsla(146, 60%, 52%, 0.32);
+  }
+  .state-pill.amber {
+    color: var(--amber-9);
+    background: var(--amber-3);
+    border: 1px solid hsla(38, 92%, 55%, 0.32);
+  }
+  .state-pill.red {
+    color: var(--red-9);
+    background: var(--red-3);
+    border: 1px solid hsla(358, 75%, 60%, 0.32);
+  }
+  .state-pill.grey {
+    color: var(--text-3);
+    background: var(--grey-3);
+    border: 1px solid var(--border-2);
+  }
+
+  /* ---------------- Card / panels ---------------- */
+
+  .panel {
+    padding: 12px 14px;
+    border-radius: var(--radius-3);
+    background:
+      linear-gradient(180deg, hsla(230, 14%, 14%, 0.6), hsla(230, 14%, 10%, 0.6)),
+      var(--bg-2);
+    border: 1px solid var(--border-1);
+    box-shadow: var(--shadow-1);
+    backdrop-filter: blur(8px);
+  }
+  .panel-section + .panel-section { margin-top: 12px; }
+
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .panel-title::before {
+    content: "";
+    width: 3px;
+    height: 11px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent-2), var(--accent-5));
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .stat {
+    padding: 10px 12px;
+    border-radius: var(--radius-2);
+    background: var(--bg-3);
+    border: 1px solid var(--border-1);
+  }
+  .stat .label {
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .stat .value {
+    margin-top: 4px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-1);
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+  }
+  .stat .value.accent {
+    background: linear-gradient(135deg, var(--accent-2), var(--accent-5));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-weight: 600;
+  }
+
+  /* ---------------- Debug accordion ---------------- */
+
+  details.debug {
+    margin-top: 10px;
+    border-radius: var(--radius-2);
+    background: var(--bg-3);
+    border: 1px solid var(--border-1);
+    overflow: hidden;
+  }
+  details.debug > summary {
+    list-style: none;
     cursor: pointer;
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    user-select: none;
   }
-  button:hover { background: #2a303c; }
-  button:active { background: #353c4a; }
+  details.debug > summary::-webkit-details-marker { display: none; }
+  details.debug > summary::after {
+    content: "+";
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text-3);
+    transition: transform 0.18s ease;
+  }
+  details.debug[open] > summary::after { content: "−"; }
+
+  details.debug .debug-body {
+    padding: 0 12px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-2);
+    line-height: 1.6;
+    word-break: break-all;
+  }
+  details.debug .debug-body .k { color: var(--text-3); }
+  details.debug .debug-body .v { color: var(--text-1); }
+
+  /* ---------------- Footer / Buttons ---------------- */
+
+  .footer {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  button {
+    appearance: none;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius-2);
+    background: var(--bg-3);
+    color: var(--text-1);
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  button:hover {
+    background: hsla(230, 14%, 18%, 1);
+    border-color: hsla(230, 12%, 80%, 0.2);
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  button.primary {
+    background: linear-gradient(135deg, var(--accent-2), var(--accent-4));
+    border-color: hsla(258, 90%, 66%, 0.4);
+    color: white;
+    box-shadow: 0 1px 0 hsla(0, 0%, 100%, 0.1) inset, 0 4px 12px -4px hsla(258, 90%, 66%, 0.5);
+  }
+  button.primary:hover {
+    background: linear-gradient(135deg, hsl(258, 90%, 70%), hsl(217, 91%, 64%));
+  }
+
+  /* Inline icon helpers */
+  .icon { width: 12px; height: 12px; flex-shrink: 0; }
+
+  /* Transient toast */
+  .toast {
+    position: fixed;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    box-shadow: var(--shadow-2);
+    color: var(--text-1);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 10;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 </style>
 </head>
 <body class="state-offline">
-  <header>
-    <span class="led" id="led" aria-hidden="true"></span>
-    <h1>Pi Chrome Connector</h1>
-    <span class="ver" id="ver">—</span>
-  </header>
-  <main id="main">
-    <div class="row">
-      <span class="label">Status</span>
-      <span class="value" id="state">offline</span>
-    </div>
-    <div class="row">
-      <span class="label">Bridge</span>
-      <span class="value mono" id="bridge">—</span>
-    </div>
-    <div class="row">
-      <span class="label">Targets</span>
-      <span class="value" id="targets">0</span>
-    </div>
-    <div class="row">
-      <span class="label">Last success</span>
-      <span class="value mono" id="lastOk">never</span>
-    </div>
-    <div class="row">
-      <span class="label">Last auth</span>
-      <span class="value mono" id="lastAuth">never</span>
-    </div>
-    <div class="error" id="error" style="display: none;"></div>
-  </main>
-  <footer>
-    <button id="copy">Copy diagnostic</button>
-    <button id="doctor">Doctor in Pi</button>
-  </footer>
+  <div class="stack">
+
+    <header class="header">
+      <div class="led-wrap" aria-hidden="true">
+        <div class="led-ring grey" id="ledRing"></div>
+        <div class="led-dot grey" id="ledDot"></div>
+      </div>
+      <div>
+        <h1>Pi Chrome Connector</h1>
+        <p class="subtitle">v<span id="ver">—</span> · bridge <span id="bridgeShort">—</span></p>
+      </div>
+      <span class="state-pill grey" id="statePill">offline</span>
+    </header>
+
+    <section class="panel">
+      <h2 class="panel-title">Connection</h2>
+      <div class="grid-2">
+        <div class="stat">
+          <div class="label">Bridge URL</div>
+          <div class="value" id="bridge">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Automation Targets</div>
+          <div class="value accent" id="targets">0</div>
+        </div>
+      </div>
+
+      <details class="debug">
+        <summary>Debug info</summary>
+        <div class="debug-body" id="debugBody"></div>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Commands</h2>
+      <div class="footer">
+        <button id="copy">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          Copy diagnostic
+        </button>
+        <button id="doctor" class="primary">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          Doctor in Pi
+        </button>
+      </div>
+    </section>
+
+    <div class="toast" id="toast">Copied</div>
+  </div>
+
   <script>
     const $ = (id) => document.getElementById(id);
-    const STATE_LABEL = { online: "online", auth: "auth needed", offline: "offline" };
+
+    const STATE = {
+      online:  { label: "online",  pill: "green", dotClass: "green", ringClass: "green"  },
+      auth:    { label: "auth",    pill: "amber", dotClass: "amber", ringClass: "amber"  },
+      offline: { label: "offline", pill: "red",   dotClass: "red",   ringClass: "red"    },
+    };
+
     function fmtTime(ms) {
       if (!ms) return "never";
-      const d = new Date(ms);
-      const ago = Math.floor((Date.now() - ms) / 1000);
-      return d.toLocaleTimeString() + " (" + ago + "s ago)";
+      const ago = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      const t = new Date(ms);
+      const hh = String(t.getHours()).padStart(2, "0");
+      const mm = String(t.getMinutes()).padStart(2, "0");
+      const ss = String(t.getSeconds()).padStart(2, "0");
+      return `${hh}:${mm}:${ss} · ${ago}s ago`;
     }
-    function render(snapshot) {
-      const state = snapshot.state || "offline";
+
+    function shortBridge(url) {
+      if (!url) return "—";
+      try {
+        const u = new URL(url);
+        return u.host;
+      } catch { return url; }
+    }
+
+    function setStateVisual(state) {
+      const meta = STATE[state] || STATE.offline;
       document.body.className = "state-" + state;
-      $("led").className = "led " + state;
-      $("ver").textContent = "v" + (snapshot.companionVersion || "?");
-      $("state").textContent = STATE_LABEL[state] || state;
-      $("bridge").textContent = snapshot.bridgeUrl || "—";
-      $("targets").textContent = String(snapshot.automationTargetCount ?? 0);
-      $("lastOk").textContent = fmtTime(snapshot.lastSuccessAt);
-      $("lastAuth").textContent = fmtTime(snapshot.lastAuthAt);
-      const err = snapshot.lastError || "";
-      const errEl = $("error");
-      if (err && state !== "online") {
-        errEl.textContent = err;
-        errEl.style.display = "block";
-      } else {
-        errEl.style.display = "none";
-      }
+      $("ledDot").className = "led-dot " + meta.dotClass;
+      $("ledRing").className = "led-ring " + meta.ringClass;
+      $("statePill").className = "state-pill " + meta.pill;
+      $("statePill").textContent = meta.label;
     }
-    // Live updates from the service worker via a dedicated port.
+
+    let lastSnapshot = null;
+    function render(snapshot) {
+      lastSnapshot = snapshot;
+      const state = snapshot.state || "offline";
+      setStateVisual(state);
+      $("ver").textContent = snapshot.companionVersion || "?";
+      $("bridge").textContent = snapshot.bridgeUrl || "—";
+      $("bridgeShort").textContent = shortBridge(snapshot.bridgeUrl);
+      $("targets").textContent = String(snapshot.automationTargetCount ?? 0);
+
+      const dbg = $("debugBody");
+      const rows = [
+        ["companionVersion", snapshot.companionVersion],
+        ["bridgeUrl",        snapshot.bridgeUrl],
+        ["state",            snapshot.state],
+        ["automationTargets",snapshot.automationTargetCount],
+        ["lastSuccessAt",    snapshot.lastSuccessAt ? new Date(snapshot.lastSuccessAt).toISOString() : "never"],
+        ["lastAuthAt",       snapshot.lastAuthAt ? new Date(snapshot.lastAuthAt).toISOString() : "never"],
+        ["lastError",        snapshot.lastError || "(none)"],
+      ];
+      dbg.innerHTML = rows
+        .map(([k, v]) => `<div><span class="k">${k}</span> <span class="v">${escapeHtml(String(v))}</span></div>`)
+        .join("");
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function toast(msg) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 1500);
+    }
+
+    // Live updates from the service worker.
     let port = null;
     function connect() {
       try {
@@ -189,43 +529,42 @@
           port = null;
           setTimeout(connect, 500);
         });
-      } catch (e) {
-        // Service worker not ready yet; retry shortly.
+      } catch {
         setTimeout(connect, 500);
       }
     }
     connect();
-    // Re-render relative timestamps every second without needing a fresh message.
-    setInterval(() => {
-      const lastText = $("lastOk").textContent;
-      if (lastText.includes("ago")) {
-        // Trigger a no-op re-render: we need a snapshot to recompute, but the most
-        // recent timestamp is fixed. Simplest: read from the last snapshot stored.
-        if (lastSnapshot) render(lastSnapshot);
-      }
-    }, 1000);
-    let lastSnapshot = null;
-    const origRender = render;
-    render = function(s) { lastSnapshot = s; origRender(s); };
+
+    // Refresh relative timestamps every second without a fresh message.
+    setInterval(() => { if (lastSnapshot) render(lastSnapshot); }, 1000);
+
     $("copy").addEventListener("click", async () => {
+      const s = lastSnapshot || {};
       const text = [
         "pi-chrome status snapshot",
-        "  state: " + ($("state").textContent),
-        "  companion: " + (lastSnapshot?.companionVersion || "?"),
-        "  bridge: " + (lastSnapshot?.bridgeUrl || "?"),
-        "  automation targets: " + (lastSnapshot?.automationTargetCount ?? 0),
-        "  last success: " + (lastSnapshot?.lastSuccessAt ? new Date(lastSnapshot.lastSuccessAt).toISOString() : "never"),
-        "  last auth check: " + (lastSnapshot?.lastAuthAt ? new Date(lastSnapshot.lastAuthAt).toISOString() : "never"),
-        "  last error: " + (lastSnapshot?.lastError || "(none)"),
+        "  state:              " + (s.state || "offline"),
+        "  companionVersion:   " + (s.companionVersion || "?"),
+        "  bridgeUrl:          " + (s.bridgeUrl || "?"),
+        "  automationTargets:  " + (s.automationTargetCount ?? 0),
+        "  lastSuccessAt:      " + (s.lastSuccessAt ? new Date(s.lastSuccessAt).toISOString() : "never"),
+        "  lastAuthAt:         " + (s.lastAuthAt ? new Date(s.lastAuthAt).toISOString() : "never"),
+        "  lastError:          " + (s.lastError || "(none)"),
       ].join("\n");
-      try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; setTimeout(() => $("copy").textContent = "Copy diagnostic", 1500); } catch {}
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("Copied diagnostic");
+      } catch {
+        toast("Copy failed");
+      }
     });
-    $("doctor").addEventListener("click", () => {
-      // We can't launch Pi from the extension. Copy a one-line prompt the user can paste.
-      const text = "/chrome doctor";
-      try { navigator.clipboard.writeText(text); } catch {}
-      $("doctor").textContent = "Copied — paste in Pi";
-      setTimeout(() => $("doctor").textContent = "Doctor in Pi", 1500);
+
+    $("doctor").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText("/chrome doctor");
+        toast("Copied — paste in Pi");
+      } catch {
+        toast("Copy failed");
+      }
     });
   </script>
 </body>
