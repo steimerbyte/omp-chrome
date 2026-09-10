@@ -4,44 +4,45 @@
 <meta charset="utf-8" />
 <title>Pi Chrome Connector</title>
 <style>
-  /* Radix-aligned color tokens (no external font; ship a small bundle). */
+  /* NVIDIA green + AMOLED black palette. */
   :root {
     color-scheme: dark;
 
-    /* Radix accent + gray scales, dark mode. */
-    --accent-1: hsl(263, 70%, 58%);   /* iris-9 */
-    --accent-2: hsl(258, 90%, 66%);   /* violet-9 */
-    --accent-3: hsl(244, 100%, 69%);  /* indigo-9 */
-    --accent-4: hsl(217, 91%, 60%);   /* blue-9 */
-    --accent-5: hsl(189, 94%, 43%);   /* cyan-9 */
+    /* NVIDIA brand green (close to #76B900). */
+    --nv-green: #76b900;
+    --nv-green-2: #8ed420;
+    --nv-green-3: #5e9300;
+    --nv-green-glow: hsla(82, 100%, 38%, 0.45);
 
-    --bg-1: hsl(230, 16%, 6%);       /* app bg */
-    --bg-2: hsl(230, 14%, 9%);       /* panel */
-    --bg-3: hsl(230, 13%, 12%);      /* panel-elevated */
+    /* AMOLED pure black + near-black surfaces. */
+    --bg-1: #000000;            /* AMOLED base */
+    --bg-2: #050505;            /* panel */
+    --bg-3: #0a0a0a;            /* panel-elevated */
 
-    --border-1: hsla(230, 12%, 80%, 0.06);
-    --border-2: hsla(230, 12%, 80%, 0.12);
+    --border-1: hsla(82, 100%, 38%, 0.10);
+    --border-2: hsla(82, 100%, 38%, 0.22);
 
-    --text-1: hsl(220, 14%, 96%);
-    --text-2: hsl(220, 10%, 80%);
-    --text-3: hsl(220, 8%, 60%);
+    --text-1: #f5f7f0;
+    --text-2: #c2c8b8;
+    --text-3: #7d8275;
 
-    --green-9: hsl(146, 60%, 52%);
-    --green-3: hsla(146, 60%, 52%, 0.18);
-    --amber-9: hsl(38, 92%, 55%);
-    --amber-3: hsla(38, 92%, 55%, 0.18);
-    --red-9:   hsl(358, 75%, 60%);
-    --red-3:   hsla(358, 75%, 60%, 0.18);
-    --grey-9:  hsl(230, 8%, 46%);
-    --grey-3:  hsla(230, 8%, 46%, 0.18);
+    --green-9: var(--nv-green);
+    --green-3: hsla(82, 100%, 38%, 0.20);
+    --amber-9: #f5a623;
+    --amber-3: hsla(38, 92%, 55%, 0.20);
+    --red-9:   #ff3b30;
+    --red-3:   hsla(358, 75%, 60%, 0.20);
+    --grey-9:  #555a52;
+    --grey-3:  hsla(0, 0%, 30%, 0.4);
 
     --radius-1: 4px;
     --radius-2: 6px;
     --radius-3: 8px;
     --radius-4: 12px;
 
-    --shadow-1: 0 1px 2px rgba(0,0,0,0.4);
-    --shadow-2: 0 4px 16px -2px rgba(0,0,0,0.5), 0 0 0 1px var(--border-1);
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.6);
+    --shadow-2: 0 4px 16px -2px rgba(0,0,0,0.8), 0 0 0 1px var(--border-1);
+    --shadow-nv: 0 0 12px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.05) inset;
 
     --font-sans: -apple-system, BlinkMacSystemFont, "Inter var", "Inter", "Segoe UI", system-ui, sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -63,11 +64,11 @@
 
   body {
     min-height: 100vh;
-    /* Layered background: deep base + radial accent washes + faint grid optical layer. */
+    /* AMOLED black + NVIDIA green accent washes. */
     background:
-      radial-gradient(circle at 0% 0%, hsla(263, 70%, 58%, 0.18) 0%, transparent 45%),
-      radial-gradient(circle at 100% 100%, hsla(189, 94%, 43%, 0.12) 0%, transparent 50%),
-      var(--bg-1);
+      radial-gradient(circle at 0% 0%, hsla(82, 100%, 38%, 0.16) 0%, transparent 45%),
+      radial-gradient(circle at 100% 100%, hsla(82, 100%, 38%, 0.10) 0%, transparent 50%),
+      #000000;
     overflow-x: hidden;
   }
 
@@ -94,7 +95,7 @@
     inset: 0;
     pointer-events: none;
     z-index: 0;
-    background: linear-gradient(115deg, transparent 30%, hsla(263, 70%, 58%, 0.04) 50%, transparent 70%);
+    background: linear-gradient(115deg, transparent 30%, hsla(82, 100%, 38%, 0.05) 50%, transparent 70%);
     animation: drift 12s linear infinite;
   }
 
@@ -121,7 +122,7 @@
     padding: 12px 14px;
     border-radius: var(--radius-4);
     background:
-      linear-gradient(135deg, hsla(263, 70%, 58%, 0.08), hsla(189, 94%, 43%, 0.04)),
+      linear-gradient(135deg, hsla(82, 100%, 38%, 0.10), hsla(82, 100%, 38%, 0.04)),
       var(--bg-2);
     border: 1px solid var(--border-2);
     box-shadow: var(--shadow-2);
@@ -143,10 +144,10 @@
     opacity: 0.5;
     animation: pulse 2.4s ease-in-out infinite;
   }
-  .led-ring.green  { background: var(--green-9); box-shadow: 0 0 12px var(--green-9); }
-  .led-ring.amber  { background: var(--amber-9); box-shadow: 0 0 12px var(--amber-9); }
-  .led-ring.red    { background: var(--red-9);   box-shadow: 0 0 12px var(--red-9);   }
-  .led-ring.grey   { background: var(--grey-9);  box-shadow: 0 0 4px var(--grey-9);   animation: none; opacity: 0.35; }
+  .led-ring.green  { background: var(--nv-green); box-shadow: 0 0 12px var(--nv-green); }
+  .led-ring.amber  { background: var(--amber-9);   box-shadow: 0 0 12px var(--amber-9); }
+  .led-ring.red    { background: var(--red-9);     box-shadow: 0 0 12px var(--red-9); }
+  .led-ring.grey   { background: var(--grey-9);    box-shadow: 0 0 4px var(--grey-9); animation: none; opacity: 0.35; }
   @keyframes pulse {
     0%, 100% { transform: scale(1);   opacity: 0.45; }
     50%      { transform: scale(1.5); opacity: 0; }
@@ -159,9 +160,9 @@
     border-radius: 50%;
     z-index: 1;
   }
-  .led-dot.green { background: var(--green-9); box-shadow: 0 0 6px var(--green-9); }
-  .led-dot.amber { background: var(--amber-9); box-shadow: 0 0 6px var(--amber-9); }
-  .led-dot.red   { background: var(--red-9);   box-shadow: 0 0 6px var(--red-9); }
+  .led-dot.green { background: var(--nv-green); box-shadow: 0 0 6px var(--nv-green); }
+  .led-dot.amber { background: var(--amber-9);  box-shadow: 0 0 6px var(--amber-9); }
+  .led-dot.red   { background: var(--red-9);    box-shadow: 0 0 6px var(--red-9); }
   .led-dot.grey  { background: var(--grey-9); }
 
   .header h1 {
@@ -192,9 +193,9 @@
     font-variant-numeric: tabular-nums;
   }
   .state-pill.green {
-    color: var(--green-9);
+    color: var(--nv-green);
     background: var(--green-3);
-    border: 1px solid hsla(146, 60%, 52%, 0.32);
+    border: 1px solid hsla(82, 100%, 38%, 0.32);
   }
   .state-pill.amber {
     color: var(--amber-9);
@@ -224,7 +225,6 @@
     box-shadow: var(--shadow-1);
     backdrop-filter: blur(8px);
   }
-  .panel-section + .panel-section { margin-top: 12px; }
 
   .panel-title {
     display: flex;
@@ -242,7 +242,7 @@
     width: 3px;
     height: 11px;
     border-radius: 2px;
-    background: linear-gradient(180deg, var(--accent-2), var(--accent-5));
+    background: linear-gradient(180deg, var(--nv-green), var(--nv-green-3));
   }
 
   .grid-2 {
@@ -272,7 +272,7 @@
     word-break: break-all;
   }
   .stat .value.accent {
-    background: linear-gradient(135deg, var(--accent-2), var(--accent-5));
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
@@ -335,36 +335,41 @@
 
   button {
     appearance: none;
-    border: 1px solid var(--border-2);
+    /* NVIDIA-green across both action buttons. */
+    border: 1px solid var(--nv-green-3);
     border-radius: var(--radius-2);
-    background: var(--bg-3);
-    color: var(--text-1);
+    background: linear-gradient(135deg, var(--nv-green), var(--nv-green-3));
+    color: #051000;
     padding: 8px 10px;
     font-family: inherit;
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 600;
     cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease, transform 0.12s ease;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 6px;
+    box-shadow: var(--shadow-nv);
   }
   button:hover {
-    background: hsla(230, 14%, 18%, 1);
-    border-color: hsla(230, 12%, 80%, 0.2);
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
+    border-color: var(--nv-green);
+    box-shadow: 0 0 18px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.08) inset;
   }
   button:active { transform: translateY(1px); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
 
   button.primary {
-    background: linear-gradient(135deg, var(--accent-2), var(--accent-4));
-    border-color: hsla(258, 90%, 66%, 0.4);
-    color: white;
-    box-shadow: 0 1px 0 hsla(0, 0%, 100%, 0.1) inset, 0 4px 12px -4px hsla(258, 90%, 66%, 0.5);
+    /* Slightly heavier gradient + bigger glow to keep a soft hierarchy between the two actions. */
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
+    border-color: var(--nv-green);
+    color: #051000;
+    box-shadow: 0 1px 0 hsla(0, 0%, 100%, 0.15) inset, 0 0 18px var(--nv-green-glow);
   }
   button.primary:hover {
-    background: linear-gradient(135deg, hsl(258, 90%, 70%), hsl(217, 91%, 64%));
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green-2));
+    box-shadow: 0 0 24px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.18) inset;
   }
 
   /* Inline icon helpers */
@@ -519,7 +524,6 @@
       toast._t = setTimeout(() => el.classList.remove("show"), 1500);
     }
 
-    // Live updates from the service worker.
     let port = null;
     function connect() {
       try {
@@ -535,7 +539,6 @@
     }
     connect();
 
-    // Refresh relative timestamps every second without a fresh message.
     setInterval(() => { if (lastSnapshot) render(lastSnapshot); }, 1000);
 
     $("copy").addEventListener("click", async () => {
