@@ -164,39 +164,42 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   for (const t of automationTargets.values()) if (t.tabId === tabId) return true;
   return false;
 }
+// Initial URL for automation targets. about:blank is unusable: chrome.scripting.executeScript
+// refuses to inject into about:* tabs (manifest host_permissions cannot cover about: — Chrome
+// treats it as an opaque scheme with no extension access), so snapshot/inspect/click would all
+// throw "Cannot access contents of url 'about:blank'". A data: URL with a minimal HTML doc is
+// injectable (chrome.scripting allows data:), stays in-process (no network), and gives us a
+// real document to attach the debugger and inject scripts into. The page itself is a blank
+// `<title>Pi Chrome</title>` shell so chrome_snapshot/inspect have something legal to land on.
+const AUTOMATION_TARGET_URL = "data:text/html,<!doctype html><title>Pi%20Chrome</title>";
 
-// Create a fresh automation target for `sessionKey`. If this session already has a tab group,
-// create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
-// groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
-// tab. When the tab is created in a pre-existing group window, leave windowId unset so cleanup only
-// closes our tab, never that whole window.
 async function createAutomationTarget(sessionKey, groupTitle) {
-  const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
-  if (existingGroup && typeof existingGroup.windowId === "number") {
-    const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
-    automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
-    await persistAutomationTargets();
-    return tab;
-  }
-  if (chrome.windows && typeof chrome.windows.create === "function") {
-    try {
-      const win = await chrome.windows.create({ url: "about:blank", focused: false });
-      const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
-      if (created && typeof created.id === "number") {
-        automationTargets.set(sessionKey, { windowId: typeof win.id === "number" ? win.id : undefined, tabId: created.id });
-        await persistAutomationTargets();
-        return created;
-      }
-    } catch {
-      // Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
-    }
-  }
-  // Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
-  // must leave windowId unset — cleanup then closes only our tab, never the user's window.
-  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
-  automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
-  await persistAutomationTargets();
-  return tab;
+	const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
+	if (existingGroup && typeof existingGroup.windowId === "number") {
+		const tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false, windowId: existingGroup.windowId });
+		automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
+		await persistAutomationTargets();
+		return tab;
+	}
+	if (chrome.windows && typeof chrome.windows.create === "function") {
+		try {
+			const win = await chrome.windows.create({ url: AUTOMATION_TARGET_URL, focused: false });
+			const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
+			if (created && typeof created.id === "number") {
+				automationTargets.set(sessionKey, { windowId: typeof win.id === "number" ? win.id : undefined, tabId: created.id });
+				await persistAutomationTargets();
+				return created;
+			}
+		} catch {
+			// Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
+		}
+	}
+	// Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
+	// must leave windowId unset — cleanup then closes only our tab, never the user's window.
+	const tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false });
+	automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
+	await persistAutomationTargets();
+	return tab;
 }
 
 // Return the session's owned automation target if it still exists, else null. Robust to the user
@@ -1482,11 +1485,10 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
       );
     }
   }
-  if (!tab?.id) throw new Error("No matching Chrome tab found");
-  const url = tab.url || "";
-  if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://")) {
-    throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}`);
-  }
+	const url = tab.url || "";
+	if (url.startsWith("about:") || url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://") || url.startsWith("edge://")) {
+		throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}. Navigate the tab to an http(s) URL and retry.`);
+	}
   // Tabs Pi interacts with (page.* actions) join this session's group so the user can see exactly
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
