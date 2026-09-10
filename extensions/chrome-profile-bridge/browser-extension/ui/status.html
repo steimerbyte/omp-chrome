@@ -523,8 +523,16 @@
       clearTimeout(toast._t);
       toast._t = setTimeout(() => el.classList.remove("show"), 1500);
     }
-
     let port = null;
+    // Try a one-shot sendMessage first; if the service worker is asleep this triggers a wakeup
+    // before chrome.runtime.connect succeeds. Then long-lived port for live updates.
+    function fetchOnce() {
+      try {
+        chrome.runtime.sendMessage({ type: "popup.getStatus" }, (response) => {
+          if (response && typeof response === "object") render(response);
+        });
+      } catch {}
+    }
     function connect() {
       try {
         port = chrome.runtime.connect({ name: "popup" });
@@ -537,8 +545,8 @@
         setTimeout(connect, 500);
       }
     }
+    fetchOnce();
     connect();
-
     setInterval(() => { if (lastSnapshot) render(lastSnapshot); }, 1000);
 
     $("copy").addEventListener("click", async () => {

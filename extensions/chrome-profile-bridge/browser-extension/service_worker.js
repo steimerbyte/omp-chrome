@@ -65,6 +65,18 @@ if (chrome.runtime && chrome.runtime.onConnect) {
     port.onDisconnect.addListener(() => { popupPorts.delete(port); });
   });
 }
+// One-shot fallback for popup.getStatus requests. Useful when chrome.runtime.connect somehow
+// fails to wake the worker (mv3 keeps the worker suspended and onConnect sometimes returns
+// before the listener is registered after reload).
+if (chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg && msg.type === "popup.getStatus") {
+      sendResponse(buildStatusSnapshot());
+      return true;
+    }
+    return false;
+  });
+}
 updateBadge(); // initial paint: red until pollLoop proves otherwise. Direct call (not
 // setConnectionState) so we do not broadcast a snapshot before BRIDGE_URL is initialized.
 const BRIDGE_URL = "http://127.0.0.1:17318";
