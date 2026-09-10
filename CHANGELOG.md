@@ -1,6 +1,29 @@
 # Changelog
 
 All notable user-facing changes to `pi-chrome`.
+## 0.15.54 — 2026-09-10
+
+- **Switch the automation target URL to the companion extension's own origin.**
+  - 0.15.52 moved `about:blank` → `data:text/html,…` because `chrome.scripting.executeScript`
+    cannot inject into `about:` tabs even with `host_permissions: ["<all_urls>"]`. Live
+    verification of 0.15.52/0.15.53 against Brave showed that `data:` URLs are also rejected
+    (`Cannot access contents of url "data:text/html,…". Extension manifest must request
+    permission to access this host.`) — `data:` URLs are out of scope for extension script
+    injection regardless of the manifest pattern, so the original error resurfaced the moment
+    `chrome_snapshot` tried to drive the new tab. Same restriction on `chrome:`, `chrome-extension:`
+    (other than our own), `devtools:`, and `edge:`.
+  - Fix: point `AUTOMATION_TARGET_URL` at `chrome.runtime.getURL("ui/automation-shell.html")`,
+    a real `text/html` page shipped at `extensions/chrome-profile-bridge/browser-extension/ui/automation-shell.html`
+    with a `<title>Pi Chrome</title>` shell. Chrome's extension origin grants its own SW
+    script-injection access without any manifest entry, so `chrome.scripting.executeScript`,
+    `chrome.debugger.attach`, and `chrome_snapshot` all work against it.
+  - Survives bridge renames, multi-port installs, and bridge mode switches (server / client /
+    promote) because the URL is computed from the runtime extension id, not from the bridge.
+  - Defensive fallback to `BRIDGE_URL + "/__pi_chrome_shell"` for unit-test sandbox where
+    `chrome.runtime.getURL` may be missing.
+- **Tests.** All seven Node unit suites still pass (180+ assertions green).
+- **Companion version.** Bumped to 0.15.54 and synced by `scripts/sync-manifest-version.js`.
+
 
 ## 0.15.53 — 2026-09-10
 

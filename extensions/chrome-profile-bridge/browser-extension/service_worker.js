@@ -234,14 +234,21 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   for (const t of automationTargets.values()) if (t.tabId === tabId) return true;
   return false;
 }
-// Initial URL for automation targets. about:blank is unusable: chrome.scripting.executeScript
-// refuses to inject into about:* tabs (manifest host_permissions cannot cover about: — Chrome
-// treats it as an opaque scheme with no extension access), so snapshot/inspect/click would all
-// throw "Cannot access contents of url 'about:blank'". A data: URL with a minimal HTML doc is
-// injectable (chrome.scripting allows data:), stays in-process (no network), and gives us a
-// real document to attach the debugger and inject scripts into. The page itself is a blank
-// `<title>Pi Chrome</title>` shell so chrome_snapshot/inspect have something legal to land on.
-const AUTOMATION_TARGET_URL = "data:text/html,<!doctype html><title>Pi%20Chrome</title>";
+// Initial URL for automation targets. The lone URL scheme that chrome.scripting.executeScript
+// and chrome.debugger.attach can both reach: a real http(s) URL on an origin covered by
+// manifest host_permissions, or our own extension origin (`chrome-extension://<id>/...`),
+// which Chrome grants script-injection access to by default. We use the extension origin so
+// no extra bridge route is required and the URL is self-contained: it survives bridge
+// renames, multi-port installs, and bridge mode switches (server / client / promote). About:
+// blank is unusable (host_permissions cannot cover about: — Chrome treats it as opaque).
+// Data: URLs are unusable too (chrome.scripting rejects them even with `<all_urls>` because
+// data: has no extension access for injection). Chrome: / chrome-extension: / devtools:
+// (other than our own) are also blocked by host_permissions. ui/automation-shell.html is a
+// minimal `text/html` page with a `<title>Pi Chrome</title>` shell — chrome_snapshot uses the
+// title to label the tab and chrome_inspect / chrome_click attach to the live document.
+const AUTOMATION_TARGET_URL = (chrome.runtime && typeof chrome.runtime.getURL === "function")
+  ? chrome.runtime.getURL("ui/automation-shell.html")
+  : `${BRIDGE_URL}/__pi_chrome_shell`;
 
 async function createAutomationTarget(sessionKey, groupTitle) {
 	const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
