@@ -1,7 +1,77 @@
+// ===============================================================
+// Connection status (toolbar badge LED + popup live view)
+// ===============================================================
+// The toolbar action badge mirrors the live bridge connection so the user can see at a glance
+// whether Pi can drive Chrome right now. The popup (manifest action.default_popup) shows the
+// same data with more detail. Both are driven from one source of truth: the most recent result
+// of pollLoop() and a watchdog that flips to "offline" if the bridge stops responding.
+// Connection states:
+//   "offline"  — bridge not reachable; never spoke to us, or watchdog expired
+//   "online"   — bridge reachable; last /next returned successfully within the watchdog window
+//   "auth"     — bridge reachable, but the active Pi session is not authorized (HTTP 401/403)
+const BADGE_COLORS = {
+  offline: "#dc2626", // red-600
+  online: "#16a34a", // green-600
+  auth: "#ca8a04", // yellow-600
+};
+const BADGE_LABELS = {
+  offline: "off",
+  online: "on",
+  auth: "auth",
+};
+let lastBridgeSuccessAt = 0;
+let lastBridgeAuthAt = 0;
+let lastBridgeError = "";
+let connectionState = "offline"; // sentinel: BADGE_COLORS["offline"] is the initial paint
+function setConnectionState(next) {
+  if (connectionState === next) return;
+  connectionState = next;
+  updateBadge();
+  broadcastStatus();
+}
+function updateBadge() {
+  try {
+    chrome.action.setBadgeBackgroundColor({ color: BADGE_COLORS[connectionState] });
+    chrome.action.setBadgeText({ text: BADGE_LABELS[connectionState] });
+  } catch {
+    /* chrome.action can be missing in the unit-test sandbox; ignore */
+  }
+}
+// Open popup channels get a fresh status snapshot on connect. Future state changes are pushed.
+const popupPorts = new Set();
+function buildStatusSnapshot() {
+  return {
+    type: "status",
+    state: connectionState,
+    companionVersion: chrome.runtime.getManifest().version,
+    bridgeUrl: BRIDGE_URL,
+    lastSuccessAt: lastBridgeSuccessAt,
+    lastAuthAt: lastBridgeAuthAt,
+    lastError: lastBridgeError,
+    automationTargetCount: typeof automationTargets !== "undefined" ? automationTargets.size : 0,
+  };
+}
+function broadcastStatus() {
+  const snapshot = buildStatusSnapshot();
+  for (const port of popupPorts) {
+    try { port.postMessage(snapshot); } catch { popupPorts.delete(port); }
+  }
+}
+if (chrome.runtime && chrome.runtime.onConnect) {
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "popup") return;
+    popupPorts.add(port);
+    port.postMessage(buildStatusSnapshot());
+    port.onDisconnect.addListener(() => { popupPorts.delete(port); });
+  });
+}
+updateBadge(); // initial paint: red until pollLoop proves otherwise. Direct call (not
+// setConnectionState) so we do not broadcast a snapshot before BRIDGE_URL is initialized.
 const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
+
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const COMMAND_TIMEOUT_MS = 25_000;
@@ -1120,8 +1190,6 @@ function armKeepaliveAlarm() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.action.setBadgeText({ text: "pi" });
-  chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
   armKeepaliveAlarm();
   void pollLoop();
 });
@@ -1135,10 +1203,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "pi-bridge-keepalive") void pollLoop();
 });
 
-chrome.action.onClicked.addListener(() => {
-  armKeepaliveAlarm();
-  void pollLoop();
-});
+// Note: chrome.action.onClicked is intentionally NOT registered. The toolbar action opens the
+// popup (manifest action.default_popup) — the popup shows live status and a Doctor link.
 
 armKeepaliveAlarm();
 
@@ -1146,14 +1212,38 @@ setInterval(() => {
   void pollLoop();
 }, 1000);
 
+// Watchdog: if the bridge hasn't responded successfully in OFFLINE_AFTER_MS, flip the badge to
+// "offline" even if no explicit error fired (e.g. /next is blocking on the bridge HTTP socket).
+const OFFLINE_AFTER_MS = 4_000;
+setInterval(() => {
+  if (connectionState === "offline") return;
+  if (lastBridgeSuccessAt && Date.now() - lastBridgeSuccessAt > OFFLINE_AFTER_MS) {
+    lastBridgeError = `no response from bridge in ${OFFLINE_AFTER_MS}ms`;
+    setConnectionState("offline");
+  }
+}, 2_000);
+
 async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
-        cache: "no-store",
-      });
+      let response;
+      try {
+        response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, { cache: "no-store" });
+      } catch (err) {
+        lastBridgeError = err?.message || String(err);
+        // Watchdog will flip to offline; await below still backs off.
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      }
+      if (response.status === 401 || response.status === 403) {
+        lastBridgeError = `bridge returned HTTP ${response.status}`;
+        lastBridgeAuthAt = Date.now();
+        setConnectionState("auth");
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      }
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
@@ -1163,6 +1253,9 @@ async function pollLoop() {
         return;
       }
       const payload = await response.json();
+      lastBridgeSuccessAt = Date.now();
+      lastBridgeError = "";
+      setConnectionState("online");
       if (payload.type === "command") await handleCommand(payload.command);
     }
   } catch (error) {

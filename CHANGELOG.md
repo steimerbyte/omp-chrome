@@ -2,6 +2,14 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.53 — 2026-09-10
+
+- **Live connection-status toolbar badge (LED).** The companion extension now drives the toolbar action badge so the user can see the bridge connection state at a glance without opening the popup: green "on" while `/next` is succeeding, yellow "auth" on HTTP 401/403 (Pi session is not authorized), red "off" when the bridge is unreachable or has stopped responding within 4 s. A watchdog flips the badge back to red even when `/next` is silently blocking. The badge replaces the previous static "pi" badge.
+- **Companion status popup.** Clicking the toolbar action now opens a compact dark-themed status page (manifest `action.default_popup`) showing companion version, bridge URL, current state, automation target count, last success / last auth timestamp, and last error. The popup receives live updates via `chrome.runtime.connect({ name: "popup" })` and the service worker pushes a fresh snapshot on every state change. Two buttons: "Copy diagnostic" (puts a one-block summary on the clipboard) and "Doctor in Pi" (copies `/chrome doctor` for the user to paste into Pi).
+- **State machine without service-worker flicker.** Connection state is tracked by a single in-memory variable with sentinel-init so the very first paint is the red "off" badge; transitions go through `setConnectionState()` which updates the badge and broadcasts to open popup ports.
+- **Tests.** Added `test-suite/unit/badge-status.test.mjs` covering the initial badge paint, popup-port snapshot delivery, and non-popup-port rejection. All seven Node unit suites still pass (180+ assertions green).
+- **Companion version.** `extensions/chrome-profile-bridge/browser-extension/manifest.json` bumped to 0.15.53 by `scripts/sync-manifest-version.js`. Reload the companion at `chrome://extensions` after pulling.
+
 ## 0.15.52 — 2026-09-10
 
 - **Automation targets no longer start at `about:blank`.** `createAutomationTarget` (used by every implicit page action — navigate, click, type, snapshot, inspect, evaluate, screenshot) now opens a `data:text/html,<!doctype html><title>Pi Chrome</title>` shell. The previous `about:blank` start URL made `chrome.scripting.executeScript` throw `Cannot access contents of url "about:blank"` from `chrome_inspect` / `chrome_snapshot` because manifest `host_permissions` cannot cover the `about:` scheme. The data URL is in-process, has a real document for the debugger to attach to, and stays injectable. Same shell opens for the window-creation and tab-fallback paths.

@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Pi Chrome Connector</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12;
+    --panel: #14171f;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #8a93a6;
+    --green: #16a34a;
+    --yellow: #ca8a04;
+    --red: #dc2626;
+    --grey: #4b5563;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 320px;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .led {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--grey);
+    flex-shrink: 0;
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.04);
+  }
+  .led.online  { background: var(--green); }
+  .led.auth    { background: var(--yellow); }
+  .led.offline { background: var(--red); }
+  header h1 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    flex: 1;
+  }
+  header .ver {
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  main {
+    padding: 12px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    gap: 8px;
+  }
+  .row:last-child { border-bottom: none; }
+  .label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .value {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    word-break: break-all;
+    max-width: 200px;
+  }
+  .value.mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    font-size: 11px;
+  }
+  .state-online  .value { color: var(--green); }
+  .state-auth    .value { color: var(--yellow); }
+  .state-offline .value { color: var(--red); }
+  .error {
+    background: rgba(220, 38, 38, 0.08);
+    border: 1px solid rgba(220, 38, 38, 0.3);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-top: 8px;
+    color: #fca5a5;
+    font-size: 11px;
+    word-break: break-word;
+  }
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 8px 12px;
+    display: flex;
+    gap: 6px;
+    background: var(--panel);
+  }
+  button {
+    flex: 1;
+    background: #1f242f;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 8px;
+    font-size: 12px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:hover { background: #2a303c; }
+  button:active { background: #353c4a; }
+</style>
+</head>
+<body class="state-offline">
+  <header>
+    <span class="led" id="led" aria-hidden="true"></span>
+    <h1>Pi Chrome Connector</h1>
+    <span class="ver" id="ver">—</span>
+  </header>
+  <main id="main">
+    <div class="row">
+      <span class="label">Status</span>
+      <span class="value" id="state">offline</span>
+    </div>
+    <div class="row">
+      <span class="label">Bridge</span>
+      <span class="value mono" id="bridge">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Targets</span>
+      <span class="value" id="targets">0</span>
+    </div>
+    <div class="row">
+      <span class="label">Last success</span>
+      <span class="value mono" id="lastOk">never</span>
+    </div>
+    <div class="row">
+      <span class="label">Last auth</span>
+      <span class="value mono" id="lastAuth">never</span>
+    </div>
+    <div class="error" id="error" style="display: none;"></div>
+  </main>
+  <footer>
+    <button id="copy">Copy diagnostic</button>
+    <button id="doctor">Doctor in Pi</button>
+  </footer>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const STATE_LABEL = { online: "online", auth: "auth needed", offline: "offline" };
+    function fmtTime(ms) {
+      if (!ms) return "never";
+      const d = new Date(ms);
+      const ago = Math.floor((Date.now() - ms) / 1000);
+      return d.toLocaleTimeString() + " (" + ago + "s ago)";
+    }
+    function render(snapshot) {
+      const state = snapshot.state || "offline";
+      document.body.className = "state-" + state;
+      $("led").className = "led " + state;
+      $("ver").textContent = "v" + (snapshot.companionVersion || "?");
+      $("state").textContent = STATE_LABEL[state] || state;
+      $("bridge").textContent = snapshot.bridgeUrl || "—";
+      $("targets").textContent = String(snapshot.automationTargetCount ?? 0);
+      $("lastOk").textContent = fmtTime(snapshot.lastSuccessAt);
+      $("lastAuth").textContent = fmtTime(snapshot.lastAuthAt);
+      const err = snapshot.lastError || "";
+      const errEl = $("error");
+      if (err && state !== "online") {
+        errEl.textContent = err;
+        errEl.style.display = "block";
+      } else {
+        errEl.style.display = "none";
+      }
+    }
+    // Live updates from the service worker via a dedicated port.
+    let port = null;
+    function connect() {
+      try {
+        port = chrome.runtime.connect({ name: "popup" });
+        port.onMessage.addListener(render);
+        port.onDisconnect.addListener(() => {
+          port = null;
+          setTimeout(connect, 500);
+        });
+      } catch (e) {
+        // Service worker not ready yet; retry shortly.
+        setTimeout(connect, 500);
+      }
+    }
+    connect();
+    // Re-render relative timestamps every second without needing a fresh message.
+    setInterval(() => {
+      const lastText = $("lastOk").textContent;
+      if (lastText.includes("ago")) {
+        // Trigger a no-op re-render: we need a snapshot to recompute, but the most
+        // recent timestamp is fixed. Simplest: read from the last snapshot stored.
+        if (lastSnapshot) render(lastSnapshot);
+      }
+    }, 1000);
+    let lastSnapshot = null;
+    const origRender = render;
+    render = function(s) { lastSnapshot = s; origRender(s); };
+    $("copy").addEventListener("click", async () => {
+      const text = [
+        "pi-chrome status snapshot",
+        "  state: " + ($("state").textContent),
+        "  companion: " + (lastSnapshot?.companionVersion || "?"),
+        "  bridge: " + (lastSnapshot?.bridgeUrl || "?"),
+        "  automation targets: " + (lastSnapshot?.automationTargetCount ?? 0),
+        "  last success: " + (lastSnapshot?.lastSuccessAt ? new Date(lastSnapshot.lastSuccessAt).toISOString() : "never"),
+        "  last auth check: " + (lastSnapshot?.lastAuthAt ? new Date(lastSnapshot.lastAuthAt).toISOString() : "never"),
+        "  last error: " + (lastSnapshot?.lastError || "(none)"),
+      ].join("\n");
+      try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; setTimeout(() => $("copy").textContent = "Copy diagnostic", 1500); } catch {}
+    });
+    $("doctor").addEventListener("click", () => {
+      // We can't launch Pi from the extension. Copy a one-line prompt the user can paste.
+      const text = "/chrome doctor";
+      try { navigator.clipboard.writeText(text); } catch {}
+      $("doctor").textContent = "Copied — paste in Pi";
+      setTimeout(() => $("doctor").textContent = "Doctor in Pi", 1500);
+    });
+  </script>
+</body>
+</html>
