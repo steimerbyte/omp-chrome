@@ -343,9 +343,18 @@
 
   .footer {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
     margin-top: 4px;
+  }
+  .footer button {
+    padding: 8px 6px;
+    font-size: 11px;
+    gap: 4px;
+  }
+  .footer button .label-text { display: inline; }
+  @media (max-width: 340px) {
+    .footer { grid-template-columns: 1fr; }
   }
 
   button {
@@ -446,25 +455,19 @@
           <div class="value accent" id="targets">0</div>
         </div>
       </div>
-
-      <details class="debug">
-        <summary>Debug info</summary>
-        <div class="debug-body" id="debugBody"></div>
-      </details>
-    </section>
-
-    <section class="panel">
-      <h2 class="panel-title">Commands</h2>
       <div class="footer">
-        <button id="copy">
+        <button id="refresh" title="Refresh now">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+          <span class="label-text">Refresh</span>
+        </button>
+        <button id="copy" title="Copy diagnostic to clipboard">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-          Copy diagnostic
+          <span class="label-text">Copy</span>
         </button>
-        <button id="doctor" class="primary">
+        <button id="doctor" class="primary" title="Copy /chrome doctor to clipboard">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-          Doctor in Pi
+          <span class="label-text">Doctor</span>
         </button>
-      </div>
     </section>
 
     <div class="toast" id="toast">Copied</div>

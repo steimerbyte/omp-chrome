@@ -129,8 +129,29 @@ async function pushStatusToStorage() {
 pushStatusToStorage(); // initial paint
 setInterval(pushStatusToStorage, PUSH_INTERVAL_MS);
 
-updateBadge(); // initial paint: red until pollLoop proves otherwise. Direct call (not
-// setConnectionState) so we do not broadcast a snapshot before BRIDGE_URL is initialized.
+// One-shot IPC for popup.getStatus and popup.refresh. Popup uses sendMessage as a fallback
+// when chrome.runtime.connect races against the popup closing.
+if (chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || typeof msg !== "object") return false;
+    if (msg.type === "popup.getStatus" || msg.type === "popup.refresh") {
+      // Bypass the 1.5s probe cache on explicit refresh so the user sees a fresh read.
+      if (msg.type === "popup.refresh") {
+        lastBridgeProbe = null;
+        lastBridgeProbeAt = 0;
+      }
+      buildStatusSnapshot().then(async (snapshot) => {
+        // For refresh, also push to storage immediately so other popups reading storage see it.
+        if (msg.type === "popup.refresh" && chrome.storage?.session?.set) {
+          try { await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: snapshot }); } catch {}
+        }
+        sendResponse(snapshot);
+      });
+      return true;
+    }
+    return false;
+  });
+}
 const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
