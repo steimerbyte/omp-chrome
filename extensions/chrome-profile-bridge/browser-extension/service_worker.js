@@ -181,22 +181,32 @@ async function createAutomationTarget(sessionKey, groupTitle) {
 		await persistAutomationTargets();
 		return tab;
 	}
-	if (chrome.windows && typeof chrome.windows.create === "function") {
+	// Prefer reusing the user's currently-active window: open a background tab there instead of
+	// spawning a new Chrome window. We never replace the active tab — `active: false` keeps the
+	// user's selection intact, and background mode keeps the new tab out of focus. If the
+	// chrome.windows API is unavailable we fall through to the tab-only fallback below.
+	let activeWindowId;
+	if (chrome.windows && typeof chrome.windows.getCurrent === "function") {
 		try {
-			const win = await chrome.windows.create({ url: AUTOMATION_TARGET_URL, focused: false });
-			const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
-			if (created && typeof created.id === "number") {
-				automationTargets.set(sessionKey, { windowId: typeof win.id === "number" ? win.id : undefined, tabId: created.id });
-				await persistAutomationTargets();
-				return created;
-			}
+			const win = await chrome.windows.getCurrent();
+			if (win && typeof win.id === "number") activeWindowId = win.id;
 		} catch {
-			// Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
+			// No current window (headless / detached) — leave activeWindowId undefined.
 		}
 	}
+	const createParams = { url: AUTOMATION_TARGET_URL, active: false };
+	if (typeof activeWindowId === "number") createParams.windowId = activeWindowId;
 	// Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
-	// must leave windowId unset — cleanup then closes only our tab, never the user's window.
-	const tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false });
+	// must leave windowId unset on the automation record — cleanup then closes only our tab,
+	// never the user's window. If we passed a windowId above, chrome.tabs.create will fail with
+	// "Tabs cannot be edited right now (user may be dragging a tab)" on rare races — retry once
+	// without windowId to land the tab somewhere.
+	let tab;
+	try {
+		tab = await chrome.tabs.create(createParams);
+	} catch {
+		tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false });
+	}
 	automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
 	await persistAutomationTargets();
 	return tab;
