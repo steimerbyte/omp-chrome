@@ -111,15 +111,24 @@ if (chrome.runtime && chrome.runtime.onConnect) {
 // One-shot fallback for popup.getStatus requests. Useful when chrome.runtime.connect somehow
 // fails to wake the worker (mv3 keeps the worker suspended and onConnect sometimes returns
 // before the listener is registered after reload).
-if (chrome.runtime && chrome.runtime.onMessage) {
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg && msg.type === "popup.getStatus") {
-      buildStatusSnapshot().then((snapshot) => sendResponse(snapshot));
-      return true;
+// popups can close before an async response arrives, so a port-based snapshot can race.
+// The popup reads chrome.storage.session on open and renders synchronously. The worker
+// keeps pushing so the value is always fresh within PUSH_INTERVAL_MS.
+const POPUP_SNAPSHOT_KEY = "piChromePopupSnapshot";
+const PUSH_INTERVAL_MS = 2000;
+async function pushStatusToStorage() {
+  try {
+    const snapshot = await buildStatusSnapshot();
+    if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.set === "function") {
+      await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: snapshot });
     }
-    return false;
-  });
+  } catch {
+    /* storage may be unavailable in some sandboxed contexts; never throw out of the timer. */
+  }
 }
+pushStatusToStorage(); // initial paint
+setInterval(pushStatusToStorage, PUSH_INTERVAL_MS);
+
 updateBadge(); // initial paint: red until pollLoop proves otherwise. Direct call (not
 // setConnectionState) so we do not broadcast a snapshot before BRIDGE_URL is initialized.
 const BRIDGE_URL = "http://127.0.0.1:17318";

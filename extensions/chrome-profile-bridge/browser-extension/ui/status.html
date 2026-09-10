@@ -586,9 +586,20 @@
         setTimeout(connect, 500);
       }
     }
-    fetchOnce();
-    connect();
-    // Diagnostic: surface the popup's loaded version so the user can confirm the latest
+    // Bootstrap: read the latest cached snapshot from chrome.storage.session synchronously.
+    // The service worker pushes a fresh snapshot every ~2s, so this is never older than that
+    // and always wins the race against any in-flight port/sendMessage round-trip.
+    async function bootstrap() {
+      try {
+        if (chrome.storage && chrome.storage.session) {
+          const stored = await chrome.storage.session.get("piChromePopupSnapshot");
+          if (stored && stored.piChromePopupSnapshot) render(stored.piChromePopupSnapshot);
+        }
+      } catch {}
+      fetchOnce();
+      connect();
+    }
+    bootstrap();
     // status.html is in their popup cache. Falls back to '?' if chrome.runtime is missing.
     try {
       $("ver").textContent = chrome.runtime.getManifest().version;
