@@ -271,14 +271,29 @@
     font-variant-numeric: tabular-nums;
     word-break: break-all;
   }
-  .stat .value.accent {
-    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    font-weight: 600;
-  }
+  .stat .value.mono { font-family: var(--font-mono); font-size: 12px; }
 
+  /* Inline health-probe result under the Bridge URL stat. */
+  .probe {
+    margin-top: 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+  }
+  .probe-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--grey-9);
+    box-shadow: 0 0 4px var(--grey-9);
+    flex-shrink: 0;
+  }
+  .probe.ok    .probe-dot { background: var(--nv-green); box-shadow: 0 0 6px var(--nv-green); }
+  .probe.warn  .probe-dot { background: var(--amber-9);  box-shadow: 0 0 6px var(--amber-9);  }
+  .probe.error .probe-dot { background: var(--red-9);    box-shadow: 0 0 6px var(--red-9);    }
   /* ---------------- Debug accordion ---------------- */
 
   details.debug {
@@ -420,7 +435,11 @@
       <div class="grid-2">
         <div class="stat">
           <div class="label">Bridge URL</div>
-          <div class="value" id="bridge">—</div>
+          <div class="value mono" id="bridge">—</div>
+          <div class="probe" id="bridgeProbe">
+            <span class="probe-dot" id="probeDot"></span>
+            <span class="probe-text" id="probeText">checking…</span>
+          </div>
         </div>
         <div class="stat">
           <div class="label">Automation Targets</div>
@@ -486,6 +505,27 @@
       $("statePill").className = "state-pill " + meta.pill;
       $("statePill").textContent = meta.label;
     }
+    function renderProbe(probe) {
+      const el = $("bridgeProbe");
+      const text = $("probeText");
+      const dot = $("probeDot");
+      el.classList.remove("ok", "warn", "error");
+      if (!probe) {
+        dot.className = "probe-dot";
+        text.textContent = "no probe yet";
+        return;
+      }
+      if (probe.ok) {
+        el.classList.add("ok");
+        text.textContent = `reachable · ${probe.status} ${probe.mode} · ${probe.latencyMs}ms`;
+      } else if (probe.error) {
+        el.classList.add("error");
+        text.textContent = `unreachable · ${probe.error}`;
+      } else {
+        el.classList.add("warn");
+        text.textContent = `HTTP ${probe.status || "?"}`;
+      }
+    }
 
     let lastSnapshot = null;
     function render(snapshot) {
@@ -496,6 +536,7 @@
       $("bridge").textContent = snapshot.bridgeUrl || "—";
       $("bridgeShort").textContent = shortBridge(snapshot.bridgeUrl);
       $("targets").textContent = String(snapshot.automationTargetCount ?? 0);
+      renderProbe(snapshot.bridgeProbe);
 
       const dbg = $("debugBody");
       const rows = [

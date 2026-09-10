@@ -118,13 +118,18 @@ async function run() {
     ok(typeof h.chrome.runtime._onConnect === "function", "service worker registered a chrome.runtime.onConnect handler");
     const popupPort = h.fakeConnect({ name: "popup" });
     h.chrome.runtime._onConnect(popupPort);
-    eq(popupPort._messages.length, 1, "popup received an immediate status snapshot on connect");
-    const snap = popupPort._messages[0];
+    // The snapshot is now async (the worker probes the bridge before answering), so give it
+    // a couple of microtask ticks to flush.
+    await new Promise((r) => setTimeout(r, 50));
+    ok(popupPort._messages.length >= 1, `popup received a status snapshot on connect (got ${popupPort._messages.length})`);
+    const snap = popupPort._messages[popupPort._messages.length - 1];
+    ok(snap, "snapshot is defined");
     eq(snap.type, "status", "snapshot message type is 'status'");
     ok(typeof snap.companionVersion === "string", "snapshot includes companionVersion");
     ok(typeof snap.bridgeUrl === "string", "snapshot includes bridgeUrl");
     ok(["offline", "online", "auth"].includes(snap.state), "snapshot state is one of the three known values");
     eq(snap.automationTargetCount, 0, "snapshot starts with zero automation targets");
+    ok(snap.bridgeProbe && typeof snap.bridgeProbe === "object", "snapshot includes a bridgeProbe result");
   }
 
   // ===== Popup port ignored for non-popup names =====

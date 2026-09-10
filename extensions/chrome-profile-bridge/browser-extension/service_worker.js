@@ -37,22 +37,63 @@ function updateBadge() {
     /* chrome.action can be missing in the unit-test sandbox; ignore */
   }
 }
+// Active bridge probe: GET ${BRIDGE_URL}/status with a tight timeout. The popup exposes the
+// result so the user can confirm whether omp is reachable on the configured URL even when the
+// long-poll connection path looks fine. Cached briefly to avoid hammering the bridge.
+let lastBridgeProbeAt = 0;
+let lastBridgeProbe = null; // { ok, status, latencyMs, mode, error, url }
+async function probeBridge() {
+  const now = Date.now();
+  if (lastBridgeProbe && now - lastBridgeProbeAt < 1500) return lastBridgeProbe;
+  lastBridgeProbeAt = now;
+  const url = `${BRIDGE_URL}/status`;
+  const t0 = Date.now();
+  const ctrl = (typeof AbortController === "function") ? new AbortController() : null;
+  const timer = setTimeout(() => { try { ctrl?.abort(); } catch {} }, 1500);
+  let probe = { ok: false, status: 0, latencyMs: 0, mode: "?", error: "", url };
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: ctrl?.signal });
+    const latencyMs = Date.now() - t0;
+    let body = null;
+    try { body = await res.json(); } catch {}
+    probe = {
+      ok: res.ok,
+      status: res.status,
+      latencyMs,
+      mode: body && typeof body === "object" && body.mode ? String(body.mode) : "?",
+      error: res.ok ? "" : `HTTP ${res.status}`,
+      url,
+    };
+  } catch (e) {
+    probe = {
+      ok: false, status: 0, latencyMs: Date.now() - t0,
+      mode: "?", error: e?.message || String(e), url,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  lastBridgeProbe = probe;
+  return probe;
+}
+
 // Open popup channels get a fresh status snapshot on connect. Future state changes are pushed.
 const popupPorts = new Set();
-function buildStatusSnapshot() {
+async function buildStatusSnapshot() {
+  const probe = await probeBridge();
   return {
     type: "status",
     state: connectionState,
     companionVersion: chrome.runtime.getManifest().version,
     bridgeUrl: BRIDGE_URL,
+    bridgeProbe: probe,
     lastSuccessAt: lastBridgeSuccessAt,
     lastAuthAt: lastBridgeAuthAt,
     lastError: lastBridgeError,
     automationTargetCount: typeof automationTargets !== "undefined" ? automationTargets.size : 0,
   };
 }
-function broadcastStatus() {
-  const snapshot = buildStatusSnapshot();
+async function broadcastStatus() {
+  const snapshot = await buildStatusSnapshot();
   for (const port of popupPorts) {
     try { port.postMessage(snapshot); } catch { popupPorts.delete(port); }
   }
@@ -61,7 +102,9 @@ if (chrome.runtime && chrome.runtime.onConnect) {
   chrome.runtime.onConnect.addListener((port) => {
     if (port.name !== "popup") return;
     popupPorts.add(port);
-    port.postMessage(buildStatusSnapshot());
+    buildStatusSnapshot().then((snapshot) => {
+      try { port.postMessage(snapshot); } catch { popupPorts.delete(port); }
+    });
     port.onDisconnect.addListener(() => { popupPorts.delete(port); });
   });
 }
@@ -71,7 +114,7 @@ if (chrome.runtime && chrome.runtime.onConnect) {
 if (chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg && msg.type === "popup.getStatus") {
-      sendResponse(buildStatusSnapshot());
+      buildStatusSnapshot().then((snapshot) => sendResponse(snapshot));
       return true;
     }
     return false;
