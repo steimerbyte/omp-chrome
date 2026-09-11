@@ -80,16 +80,19 @@ async function probeBridge() {
 const popupPorts = new Set();
 async function buildStatusSnapshot() {
   const probe = await probeBridge();
-  // Also fetch the control-plane status (authorization, background) from omp. Cached for
-  // 1.5s alongside the bridge probe to avoid hammering omp on every snapshot.
+  // Only fetch the control-plane status when the bridge is reachable. A failed probe
+  // would otherwise overwrite a previously-known good control value with `null`, and
+  // the popup would show "?" instead of the last reliable state.
   let control = null;
-  try {
-    const res = await fetch(`${BRIDGE_URL}/__pi_chrome_control?action=status`, { cache: "no-store" });
-    if (res.ok) {
-      const body = await res.json();
-      if (body && body.ok) control = body.result || null;
-    }
-  } catch {}
+  if (probe && probe.ok) {
+    try {
+      const res = await fetch(`${BRIDGE_URL}/__pi_chrome_control?action=status`, { cache: "no-store" });
+      if (res.ok) {
+        const body = await res.json();
+        if (body && body.ok) control = body.result || null;
+      }
+    } catch {}
+  }
   return {
     type: "status",
     state: connectionState,
@@ -1346,15 +1349,26 @@ setInterval(() => {
   void pollLoop();
 }, 1000);
 
-// Watchdog: if the bridge hasn't responded successfully in OFFLINE_AFTER_MS, flip the badge to
-// "offline" even if no explicit error fired (e.g. /next is blocking on the bridge HTTP socket).
-const OFFLINE_AFTER_MS = 4_000;
+// Watchdog: flip to offline ONLY when the bridge is actually unreachable. We trust the
+// last probe result (cached 1.5s) and the last /next success timestamp together:
+//   - offline only when probe failed AND no recent /next success within the window
+// Otherwise the bridge may be in a brief idle window between commands; flipping to offline
+// makes the popup's connection state oscillate between online/offline for no reason.
+const OFFLINE_AFTER_MS = 8_000;
 setInterval(() => {
   if (connectionState === "offline") return;
-  if (lastBridgeSuccessAt && Date.now() - lastBridgeSuccessAt > OFFLINE_AFTER_MS) {
-    lastBridgeError = `no response from bridge in ${OFFLINE_AFTER_MS}ms`;
-    setConnectionState("offline");
-  }
+  // Trigger a fresh probe so the watchdog decision is based on ground truth, not a stale
+  // cache. We do NOT await — run the probe in parallel with the timestamp check.
+  probeBridge().then((probe) => {
+    const bridgeReachable = probe && probe.ok;
+    const recentlyPolled = lastBridgeSuccessAt && (Date.now() - lastBridgeSuccessAt) <= OFFLINE_AFTER_MS;
+    if (!bridgeReachable && !recentlyPolled) {
+      lastBridgeError = `bridge unreachable · ${probe?.error || "no recent /next success"}`;
+      setConnectionState("offline");
+    } else if (bridgeReachable && recentlyPolled) {
+      setConnectionState("online");
+    }
+  });
 }, 2_000);
 
 async function pollLoop() {
