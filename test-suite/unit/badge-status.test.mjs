@@ -127,7 +127,7 @@ async function run() {
     eq(snap.type, "status", "snapshot message type is 'status'");
     ok(typeof snap.companionVersion === "string", "snapshot includes companionVersion");
     ok(typeof snap.bridgeUrl === "string", "snapshot includes bridgeUrl");
-    ok(["offline", "online", "auth"].includes(snap.state), "snapshot state is one of the three known values");
+    ok(["offline", "connected", "authorized"].includes(snap.state), "snapshot state is one of the three known values");
     eq(snap.automationTargetCount, 0, "snapshot starts with zero automation targets");
     ok(snap.bridgeProbe && typeof snap.bridgeProbe === "object", "snapshot includes a bridgeProbe result");
   }

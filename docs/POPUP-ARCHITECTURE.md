@@ -25,7 +25,7 @@ The snapshot is a single object produced by `buildStatusSnapshot()` in
 ```ts
 {
   type: "status",
-  state: "online" | "auth" | "offline",
+  state: "connected" | "authorized" | "offline",
   companionVersion: string,
   bridgeUrl: string,
   bridgeProbe: { ok, status, latencyMs, mode, error, url },

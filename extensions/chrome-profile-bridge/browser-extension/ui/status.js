@@ -24,9 +24,9 @@ const $ = (id) => document.getElementById(id);
 
 // State visual + small formatters.
 const STATE = {
-  online:  { label: "online",  pill: "green", dotClass: "green", ringClass: "green"  },
-  auth:    { label: "auth",    pill: "amber", dotClass: "amber", ringClass: "amber"  },
-  offline: { label: "offline", pill: "red",   dotClass: "red",   ringClass: "red"    },
+  connected: { label: "connected", pill: "green", dotClass: "green", ringClass: "green" },
+  authorized: { label: "authorized", pill: "amber", dotClass: "amber", ringClass: "amber" },
+  offline: { label: "offline", pill: "red", dotClass: "red", ringClass: "red" },
 };
 function shortBridge(url) {
   if (!url) return "—";

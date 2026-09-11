@@ -6,18 +6,18 @@
 // same data with more detail. Both are driven from one source of truth: the most recent result
 // of pollLoop() and a watchdog that flips to "offline" if the bridge stops responding.
 // Connection states:
-//   "offline"  — bridge not reachable; never spoke to us, or watchdog expired
-//   "online"   — bridge reachable; last /next returned successfully within the watchdog window
-//   "auth"     — bridge reachable, but the active Pi session is not authorized (HTTP 401/403)
+//   "offline"    — bridge not reachable; never spoke to us, or watchdog expired
+//   "connected"  — bridge reachable; last /next returned successfully within the watchdog window
+//   "authorized" — bridge reachable, but the active Pi session is not authorized (HTTP 401/403)
 const BADGE_COLORS = {
   offline: "#dc2626", // red-600
-  online: "#16a34a", // green-600
-  auth: "#ca8a04", // yellow-600
+  connected: "#16a34a", // green-600
+  authorized: "#ca8a04", // yellow-600
 };
 const BADGE_LABELS = {
   offline: "off",
-  online: "on",
-  auth: "auth",
+  connected: "conn",
+  authorized: "auth",
 };
 let lastBridgeSuccessAt = 0;
 let lastBridgeAuthAt = 0;
@@ -1349,25 +1349,31 @@ setInterval(() => {
   void pollLoop();
 }, 1000);
 
-// Watchdog: flip to offline ONLY when the bridge is actually unreachable. We trust the
-// last probe result (cached 1.5s) and the last /next success timestamp together:
+// Watchdog: every tick, run a fresh bridge probe and reconcile the connection state
+// against ground truth. We trust the probe result and the last /next success timestamp
+// together, but we run unconditionally — never short-circuit on the current state — so
+// the badge can recover from "offline" once the bridge comes back.
+//   - connected when the bridge is reachable (covers both fresh /next and idle periods)
 //   - offline only when probe failed AND no recent /next success within the window
-// Otherwise the bridge may be in a brief idle window between commands; flipping to offline
-// makes the popup's connection state oscillate between online/offline for no reason.
+// The hybrid state (bridge reachable but no recent poll, OR bridge down but poll is
+// fresh) is intentionally left alone so the next /next tick resolves it without
+// flickering the toolbar LED on every idle window.
 const OFFLINE_AFTER_MS = 8_000;
 setInterval(() => {
-  if (connectionState === "offline") return;
   // Trigger a fresh probe so the watchdog decision is based on ground truth, not a stale
   // cache. We do NOT await — run the probe in parallel with the timestamp check.
   probeBridge().then((probe) => {
     const bridgeReachable = probe && probe.ok;
     const recentlyPolled = lastBridgeSuccessAt && (Date.now() - lastBridgeSuccessAt) <= OFFLINE_AFTER_MS;
-    if (!bridgeReachable && !recentlyPolled) {
+    if (bridgeReachable) {
+      lastBridgeError = "";
+      setConnectionState("connected");
+    } else if (!recentlyPolled) {
       lastBridgeError = `bridge unreachable · ${probe?.error || "no recent /next success"}`;
       setConnectionState("offline");
-    } else if (bridgeReachable && recentlyPolled) {
-      setConnectionState("online");
     }
+    // else: bridge down but /next is still fresh — leave the state alone, the next
+    // /next tick will resolve it.
   });
 }, 2_000);
 
@@ -1388,7 +1394,7 @@ async function pollLoop() {
       if (response.status === 401 || response.status === 403) {
         lastBridgeError = `bridge returned HTTP ${response.status}`;
         lastBridgeAuthAt = Date.now();
-        setConnectionState("auth");
+        setConnectionState("authorized");
         await sleep(POLL_ERROR_BACKOFF_MS);
         continue;
       }
@@ -1403,7 +1409,7 @@ async function pollLoop() {
       const payload = await response.json();
       lastBridgeSuccessAt = Date.now();
       lastBridgeError = "";
-      setConnectionState("online");
+      setConnectionState("connected");
       if (payload.type === "command") await handleCommand(payload.command);
     }
   } catch (error) {

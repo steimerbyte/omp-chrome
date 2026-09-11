@@ -7,7 +7,7 @@
 
 - The **service worker** in `extensions/chrome-profile-bridge/browser-extension/service_worker.js`
   polls `http://127.0.0.1:17318` for commands and posts results back. It owns
-  the connection state machine (`offline` / `online` / `auth`) and pushes a
+  the connection state machine (`offline` / `connected` / `authorized`) and pushes a
   fresh `StatusSnapshot` into `chrome.storage.session` every 2 seconds.
 - The **popup** (`ui/status.html` + `ui/status.js`) reads the latest snapshot
   from storage synchronously on open, then opens a long-lived port for live
@@ -30,7 +30,7 @@
 ```ts
 type StatusSnapshot = {
   type: "status";
-  state: "offline" | "online" | "auth";
+  state: "offline" | "connected" | "authorized";
   companionVersion: string;
   bridgeUrl: string;
   bridgeProbe: {

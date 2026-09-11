@@ -103,7 +103,7 @@ async function main() {
   if (!observed.error && observed) {
     ok(typeof observed.companionVersion === "string", `snapshot.companionVersion = '${observed.companionVersion}'`);
     ok(typeof observed.bridgeUrl === "string" && observed.bridgeUrl.includes("17318"), `snapshot.bridgeUrl = '${observed.bridgeUrl}'`);
-    ok(["online", "auth", "offline"].includes(observed.state), `snapshot.state = '${observed.state}'`);
+    ok(["connected", "authorized", "offline"].includes(observed.state), `snapshot.state = '${observed.state}'`);
     ok(observed.bridgeProbe && typeof observed.bridgeProbe === "object", `snapshot.bridgeProbe exists`);
     if (observed.bridgeProbe) {
       ok(typeof observed.bridgeProbe.url === "string", `bridgeProbe.url = '${observed.bridgeProbe.url}'`);
