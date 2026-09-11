@@ -72,6 +72,7 @@ function render(snapshot) {
   const bridgeShort = $("bridgeShort"); if (bridgeShort) bridgeShort.textContent = shortBridge(snapshot.bridgeUrl);
   const targets = $("targets"); if (targets) targets.textContent = String(snapshot.automationTargetCount ?? 0);
   renderProbe(snapshot.bridgeProbe);
+  renderControl(snapshot.control);
 
   const dbg = $("debugBody");
   if (!dbg) return;
@@ -85,11 +86,42 @@ function render(snapshot) {
     ["lastError",        snapshot.lastError || "(none)"],
     ["bridgeProbe.ok",   snapshot.bridgeProbe ? String(snapshot.bridgeProbe.ok) : "?"],
     ["bridgeProbe.latencyMs", snapshot.bridgeProbe ? snapshot.bridgeProbe.latencyMs : "?"],
+    ["control.authorized", snapshot.control ? String(snapshot.control.authorized) : "?"],
+    ["control.background", snapshot.control ? snapshot.control.background : "?"],
   ];
   dbg.innerHTML = rows
     .map(([k, v]) => `<div><span class="k">${k}</span> <span class="v">${escapeHtml(String(v))}</span></div>`)
     .join("");
 }
+
+function renderControl(control) {
+  const authEl = $("authState");
+  const bgEl = $("bgState");
+  if (authEl) {
+    authEl.classList.remove("locked", "authorized");
+    if (!control) { authEl.textContent = "checking…"; authEl.classList.add("locked"); }
+    else if (control.authorized) {
+      authEl.classList.add("authorized");
+      const until = control.authorizedUntil;
+      if (until === "indefinite") authEl.textContent = "authorized indefinitely";
+      else if (typeof until === "number" && until > 0) {
+        const minutesLeft = Math.max(0, Math.floor((until - Date.now()) / 60_000));
+        authEl.textContent = `authorized · ${minutesLeft}m left`;
+      } else authEl.textContent = "authorized";
+    } else {
+      authEl.classList.add("locked");
+      authEl.textContent = "locked";
+    }
+  }
+  if (bgEl) {
+    bgEl.classList.remove("on", "off");
+    if (!control) { bgEl.textContent = "—"; }
+    else if (control.background === "on") { bgEl.textContent = "on (hard)"; bgEl.classList.add("on"); }
+    else if (control.background === "off") { bgEl.textContent = "off (foreground)"; bgEl.classList.add("off"); }
+    else { bgEl.textContent = control.background; }
+  }
+}
+
 
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -143,7 +175,57 @@ try {
   if (ver) ver.textContent = chrome.runtime.getManifest().version;
 } catch {}
 
-// Refresh: ask the service worker to build a fresh snapshot now (skips the
+// Send a control message to the service worker and wait for the JSON response. Returns
+// { ok, result?, error? }. Always re-renders the latest snapshot from storage after a control
+// action so the UI reflects the new auth/background state.
+async function popupAction(type, params = {}) {
+  const snap = await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      chrome.runtime.sendMessage({ type, ...params }, (response) => {
+        finish(chrome.runtime.lastError ? null : response);
+      });
+    } catch { finish(null); }
+    setTimeout(() => finish(null), 3000);
+  });
+  if (snap && snap.ok) {
+    toast(`OK · ${type.replace("popup.", "")}`);
+  } else if (snap && snap.error) {
+    toast(`Error · ${snap.error}`);
+  } else {
+    toast(`Timeout · ${type.replace("popup.", "")}`);
+  }
+  // Read the latest snapshot from storage so auth/background state reflects the action.
+  try {
+    if (chrome.storage?.session?.get) {
+      const stored = await chrome.storage.session.get("piChromePopupSnapshot");
+      if (stored?.piChromePopupSnapshot) render(stored.piChromePopupSnapshot);
+    }
+  } catch {}
+  return snap;
+}
+
+$("auth15").addEventListener("click", async () => { await popupAction("popup.authorize", { duration: "15m" }); });
+$("authIndef").addEventListener("click", async () => { await popupAction("popup.authorize", { duration: "indefinite" }); });
+$("revoke").addEventListener("click", async () => { await popupAction("popup.revoke"); });
+$("bgToggle").addEventListener("click", async () => { await popupAction("popup.background", {}); });
+$("runDoctor").addEventListener("click", async () => {
+  const body = await popupAction("popup.doctor");
+  const wrap = $("doctorWrap");
+  const out = $("doctorBody");
+  if (wrap && out) {
+    if (body && body.ok && body.result && typeof body.result.text === "string") {
+      out.textContent = body.result.text;
+      wrap.style.display = "block";
+      wrap.open = true;
+    } else {
+      out.textContent = (body && body.error) || "Doctor request failed.";
+      wrap.style.display = "block";
+      wrap.open = true;
+    }
+  }
+});
 // cached 1.5s bridge probe and the 2s storage push interval). The worker
 // responds with the new snapshot via sendResponse AND writes it to storage,
 // so any open popup sees the update through both the port channel and the

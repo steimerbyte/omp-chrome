@@ -2,6 +2,15 @@
 
 All notable user-facing changes to `pi-chrome`.
 ## 0.15.54 — 2026-09-10
+## 0.15.57 — 2026-09-10
+
+- **Two-Way API: authorize Chrome control from the popup.** Click `15m` or `Indefinite` in the new Control panel and omp grants the grant immediately. Click `Revoke` to lock. No more opening Pi just to type `/chrome authorize`. omp exposes a new `GET /__pi_chrome_control?action=authorize|revoke|status` route; the companion service worker forwards popup messages to it and refreshes the cached snapshot so the popup reflects the new auth state right away.
+- **Two-Way API: run `/chrome doctor` from the popup.** Click `Run Doctor` and omp returns the same diagnostic text `/chrome doctor` would print, rendered inline in a `<details>` panel. No more copy-paste into Pi.
+- **Two-Way API: toggle background mode from the popup.** Click `Toggle Background` to flip between `on (hard)` and `off (foreground/watch)`.
+- **Status snapshot now carries `control` field** with `{ authorized, authorizedUntil, background }`. The popup uses it to render the lock/grant state and the background mode without an extra round-trip.
+- **Tests.** All seven Node unit suites still pass (180+ assertions).
+- **Companion version.** Bumped to 0.15.57 and synced by `scripts/sync-manifest-version.js`. Reload the companion at `chrome://extensions` after pulling. omp must reload for the new control routes to become live.
+
 
 - **Switch the automation target URL to the companion extension's own origin.**
   - 0.15.52 moved `about:blank` → `data:text/html,…` because `chrome.scripting.executeScript`

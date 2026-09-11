@@ -273,9 +273,49 @@
   }
   .stat .value.mono { font-family: var(--font-mono); font-size: 12px; }
 
+  /* Control panel: auth/background status + 3-button footer. */
+  .auth-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .auth-row .label {
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .auth-row .value {
+    margin-top: 4px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    word-break: break-word;
+  }
+  .auth-row .value.locked  { color: var(--red-9); }
+  .auth-row .value.authorized { color: var(--nv-green); }
+  .auth-row .value.on  { color: var(--nv-green); }
+  .auth-row .value.off { color: var(--text-2); }
+  .doctor-body {
+    margin: 0;
+    padding: 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-1);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--bg-3);
+    border-top: 1px solid var(--border-1);
+  }
+  .footer button.primary[disabled],
+  .footer button:disabled {
+    opacity: 0.5;
+  }
+
   /* Inline health-probe result under the Bridge URL stat. */
   .probe {
-    margin-top: 6px;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -455,6 +495,42 @@
           <div class="value accent" id="targets">0</div>
         </div>
       </div>
+
+      <details class="debug">
+        <summary>Debug info</summary>
+        <div class="debug-body" id="debugBody"></div>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Control</h2>
+      <div class="auth-row">
+        <div>
+          <div class="label">Authorization</div>
+          <div class="value" id="authState">checking…</div>
+        </div>
+        <div>
+          <div class="label">Background</div>
+          <div class="value" id="bgState">—</div>
+        </div>
+      </div>
+      <div class="footer">
+        <button id="auth15" title="Authorize Chrome control for 15 minutes">15m</button>
+        <button id="authIndef" title="Authorize indefinitely" class="primary">Indefinite</button>
+        <button id="revoke" title="Lock Chrome control now">Revoke</button>
+      </div>
+      <div class="footer" style="margin-top: 6px;">
+        <button id="bgToggle" title="Toggle background / foreground watch mode">Toggle Background</button>
+        <button id="runDoctor" title="Run /chrome doctor and show the output here" class="primary">Run Doctor</button>
+      </div>
+      <details class="debug" id="doctorWrap" style="display: none;">
+        <summary>Doctor output</summary>
+        <pre class="doctor-body" id="doctorBody"></pre>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Commands</h2>
       <div class="footer">
         <button id="refresh" title="Refresh now">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
@@ -464,10 +540,11 @@
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
           <span class="label-text">Copy</span>
         </button>
-        <button id="doctor" class="primary" title="Copy /chrome doctor to clipboard">
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+        <button id="doctor" title="Copy /chrome doctor to clipboard">
+          <svg class="icon" viewBox="0 0 24 24" stroke="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.24 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
           <span class="label-text">Doctor</span>
         </button>
+      </div>
     </section>
 
     <div class="toast" id="toast">Copied</div>

@@ -18,26 +18,14 @@
   - `/status` — connection snapshot (used by the popup's bridge probe)
   - `/next`, `/result` — long-poll command queue
   - `/__pi_chrome_shell` — automation-target HTML page
-  - `GET /__pi_chrome_control` — Two-Way API for popup commands (next feature)
+  - `GET /__pi_chrome_control` — Two-Way API for popup commands (authorize/revoke/doctor/background/status)
 
-## Features
-
-| ID  | Title                            | Status      | Where                                                                                                |
-| --- | -------------------------------- | ----------- | --------------------------------------------------------------------------------------------------- |
-| F1  | Connection status toolbar LED   | shipped 0.15.53 | `service_worker.js` — `chrome.action.setBadgeBackgroundColor` / `setBadgeText` driven by `connectionState` |
-| F2  | Bridge probe (popup side)       | shipped 0.15.55 | `service_worker.js` — `probeBridge()` does `GET /status` with 1.5s AbortController                     |
-| F3  | chrome.storage.session snapshot | shipped 0.15.56 | `service_worker.js` — `pushStatusToStorage()` every 2s, popup reads in `bootstrap()`                  |
-| F4  | NVIDIA + AMOLED popup theme     | shipped 0.15.55 | `ui/status.html` — CSS color tokens                                                                  |
-| F5  | Debug accordion                  | shipped 0.15.55 | `ui/status.html` — `<details>` with full snapshot JSON rendered                                      |
-| F6  | Copy diagnostic / Doctor clip   | shipped 0.15.55 | `ui/status.js` — `navigator.clipboard.writeText`                                                      |
-| F7  | Refresh button                   | planned       | `ui/status.html` + `ui/status.js`                                                                     |
-| F8  | Two-Way API: authorize / revoke  | planned       | new `GET /__pi_chrome_control` route on omp + popup UI                                              |
-| F9  | Two-Way API: doctor run          | planned       | new `GET /__pi_chrome_control?action=doctor` route on omp + popup UI                                  |
-| F10 | Two-Way API: background toggle   | planned       | new `GET /__pi_chrome_control?action=background&on=false` route on omp + popup UI                      |
+| F7  | Refresh button                   | shipped 0.15.56 | `ui/status.js` + `service_worker.js` `popup.refresh` handler bypasses 1.5s probe cache       |
+| F8  | Two-Way API: authorize / revoke  | shipped 0.15.57 | omp `GET /__pi_chrome_control?action=authorize|revoke`, popup buttons `15m`/`Indefinite`/`Revoke` |
+| F9  | Two-Way API: doctor run          | shipped 0.15.57 | omp `?action=doctor`, popup button `Run Doctor` shows inline result                        |
+| F10 | Two-Way API: background toggle   | shipped 0.15.57 | omp `?action=background&on=...`, popup button `Toggle Background`                              |
 | F11 | Force-reload companion           | planned       | popup button → `chrome.runtime.reload()`                                                              |
 | F12 | Open /chrome picker in a tab     | planned       | popup button → `chrome.tabs.create({ url: '...' })` after writing the command to bridge storage        |
-
-## Snapshot shape
 
 ```ts
 type StatusSnapshot = {
@@ -53,12 +41,16 @@ type StatusSnapshot = {
     error: string;
     url: string;
   };
-  lastSuccessAt: number;        // epoch ms, 0 if never
-  lastAuthAt: number;            // epoch ms, 0 if never
+  control: null | {
+    authorized: boolean;
+    authorizedUntil: number | "indefinite";
+    background: "on" | "off";
+  };
+  lastSuccessAt: number;
+  lastAuthAt: number;
   lastError: string;
   automationTargetCount: number;
 };
-```
 
 ## Bridge HTTP surface (current + planned)
 
@@ -68,12 +60,12 @@ type StatusSnapshot = {
 | GET    | `/next?name=<extensionId>` | long-poll for commands                               | shipped |
 | POST   | `/result`                  | command result                                       | shipped |
 | GET    | `/__pi_chrome_shell`        | automation target HTML                               | shipped |
-| GET    | `/__pi_chrome_control?action=authorize&duration=30m` | authorize this Pi session for chrome_* tools | planned |
-| GET    | `/__pi_chrome_control?action=revoke`             | revoke Chrome control                          | planned |
-| GET    | `/__pi_chrome_control?action=doctor`              | run `/chrome doctor`, return formatted text    | planned |
-| GET    | `/__pi_chrome_control?action=background&on=true`  | toggle background mode, return new state       | planned |
+| GET    | `/__pi_chrome_control?action=authorize&duration=30m` | authorize this Pi session for chrome_* tools | shipped |
+| GET    | `/__pi_chrome_control?action=revoke`             | revoke Chrome control                          | shipped |
+| GET    | `/__pi_chrome_control?action=doctor`              | run `/chrome doctor`, return formatted text    | shipped |
+| GET    | `/__pi_chrome_control?action=background&on=true`  | toggle background mode, return new state       | shipped |
+| GET    | `/__pi_chrome_control?action=status`               | current auth + background as JSON              | shipped |
 | GET    | `/__pi_chrome_control?action=companion-reload`    | ask companion to self-reload                   | planned |
-
 All `/__pi_chrome_control` routes return JSON: `{ ok: boolean, result?: unknown, error?: string }`.
 omp-side authentication: only allowed from `chrome-extension://` origins (mirror the
 existing `isBrowserOriginAllowed` check used for `/next`).

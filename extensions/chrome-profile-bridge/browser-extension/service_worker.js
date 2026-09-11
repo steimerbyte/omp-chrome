@@ -80,12 +80,23 @@ async function probeBridge() {
 const popupPorts = new Set();
 async function buildStatusSnapshot() {
   const probe = await probeBridge();
+  // Also fetch the control-plane status (authorization, background) from omp. Cached for
+  // 1.5s alongside the bridge probe to avoid hammering omp on every snapshot.
+  let control = null;
+  try {
+    const res = await fetch(`${BRIDGE_URL}/__pi_chrome_control?action=status`, { cache: "no-store" });
+    if (res.ok) {
+      const body = await res.json();
+      if (body && body.ok) control = body.result || null;
+    }
+  } catch {}
   return {
     type: "status",
     state: connectionState,
     companionVersion: chrome.runtime.getManifest().version,
     bridgeUrl: BRIDGE_URL,
     bridgeProbe: probe,
+    control,
     lastSuccessAt: lastBridgeSuccessAt,
     lastAuthAt: lastBridgeAuthAt,
     lastError: lastBridgeError,
@@ -129,8 +140,29 @@ async function pushStatusToStorage() {
 pushStatusToStorage(); // initial paint
 setInterval(pushStatusToStorage, PUSH_INTERVAL_MS);
 
-// One-shot IPC for popup.getStatus and popup.refresh. Popup uses sendMessage as a fallback
-// when chrome.runtime.connect races against the popup closing.
+updateBadge(); // initial paint
+
+const BRIDGE_URL = "http://127.0.0.1:17318";
+
+// Forward a popup control request to omp's /__pi_chrome_control route. Returns the parsed
+// JSON body so the popup can show the result inline.
+async function popupControlRequest(action, extraParams = {}) {
+  const params = new URLSearchParams({ action, ...extraParams });
+  const url = `${BRIDGE_URL}/__pi_chrome_control?${params.toString()}`;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    const body = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+    if (chrome.storage?.session?.set) {
+      try { await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: await buildStatusSnapshot() }); } catch {}
+    }
+    return body;
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+// One-shot IPC for popup.* messages. Popup uses sendMessage as a fallback when
+// chrome.runtime.connect races against the popup closing.
 if (chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || typeof msg !== "object") return false;
@@ -141,7 +173,6 @@ if (chrome.runtime && chrome.runtime.onMessage) {
         lastBridgeProbeAt = 0;
       }
       buildStatusSnapshot().then(async (snapshot) => {
-        // For refresh, also push to storage immediately so other popups reading storage see it.
         if (msg.type === "popup.refresh" && chrome.storage?.session?.set) {
           try { await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: snapshot }); } catch {}
         }
@@ -149,10 +180,25 @@ if (chrome.runtime && chrome.runtime.onMessage) {
       });
       return true;
     }
+    if (msg.type === "popup.authorize" || msg.type === "popup.revoke" ||
+        msg.type === "popup.doctor" || msg.type === "popup.background" ||
+        msg.type === "popup.controlStatus") {
+      const extraParams = {};
+      if (msg.type === "popup.authorize" && msg.duration) extraParams.duration = msg.duration;
+      if (msg.type === "popup.background" && typeof msg.on === "boolean") extraParams.on = String(msg.on);
+      const action = ({
+        "popup.authorize": "authorize",
+        "popup.revoke": "revoke",
+        "popup.doctor": "doctor",
+        "popup.background": "background",
+        "popup.controlStatus": "status",
+      })[msg.type];
+      popupControlRequest(action, extraParams).then((body) => sendResponse(body));
+      return true;
+    }
     return false;
   });
 }
-const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
