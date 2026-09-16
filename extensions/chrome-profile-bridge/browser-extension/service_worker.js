@@ -1,7 +1,211 @@
+// ===============================================================
+// Connection status (toolbar badge LED + popup live view)
+// ===============================================================
+// The toolbar action badge mirrors the live bridge connection so the user can see at a glance
+// whether Pi can drive Chrome right now. The popup (manifest action.default_popup) shows the
+// same data with more detail. Both are driven from one source of truth: the most recent result
+// of pollLoop() and a watchdog that flips to "offline" if the bridge stops responding.
+// Connection states:
+//   "offline"    — bridge not reachable; never spoke to us, or watchdog expired
+//   "connected"  — bridge reachable; last /next returned successfully within the watchdog window
+//   "authorized" — bridge reachable, but the active Pi session is not authorized (HTTP 401/403)
+const BADGE_COLORS = {
+  offline: "#dc2626", // red-600
+  connected: "#16a34a", // green-600
+  authorized: "#ca8a04", // yellow-600
+};
+const BADGE_LABELS = {
+  offline: "off",
+  connected: "conn",
+  authorized: "auth",
+};
+let lastBridgeSuccessAt = 0;
+let lastBridgeAuthAt = 0;
+let lastBridgeError = "";
+let connectionState = "offline"; // sentinel: BADGE_COLORS["offline"] is the initial paint
+function setConnectionState(next) {
+  if (connectionState === next) return;
+  connectionState = next;
+  updateBadge();
+  broadcastStatus();
+}
+function updateBadge() {
+  try {
+    chrome.action.setBadgeBackgroundColor({ color: BADGE_COLORS[connectionState] });
+    chrome.action.setBadgeText({ text: BADGE_LABELS[connectionState] });
+  } catch {
+    /* chrome.action can be missing in the unit-test sandbox; ignore */
+  }
+}
+// Active bridge probe: GET ${BRIDGE_URL}/status with a tight timeout. The popup exposes the
+// result so the user can confirm whether omp is reachable on the configured URL even when the
+// long-poll connection path looks fine. Cached briefly to avoid hammering the bridge.
+let lastBridgeProbeAt = 0;
+let lastBridgeProbe = null; // { ok, status, latencyMs, mode, error, url }
+async function probeBridge() {
+  const now = Date.now();
+  if (lastBridgeProbe && now - lastBridgeProbeAt < 1500) return lastBridgeProbe;
+  lastBridgeProbeAt = now;
+  const url = `${BRIDGE_URL}/status`;
+  const t0 = Date.now();
+  const ctrl = (typeof AbortController === "function") ? new AbortController() : null;
+  const timer = setTimeout(() => { try { ctrl?.abort(); } catch {} }, 1500);
+  let probe = { ok: false, status: 0, latencyMs: 0, mode: "?", error: "", url };
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: ctrl?.signal });
+    const latencyMs = Date.now() - t0;
+    let body = null;
+    try { body = await res.json(); } catch {}
+    probe = {
+      ok: res.ok,
+      status: res.status,
+      latencyMs,
+      mode: body && typeof body === "object" && body.mode ? String(body.mode) : "?",
+      error: res.ok ? "" : `HTTP ${res.status}`,
+      url,
+    };
+  } catch (e) {
+    probe = {
+      ok: false, status: 0, latencyMs: Date.now() - t0,
+      mode: "?", error: e?.message || String(e), url,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  lastBridgeProbe = probe;
+  return probe;
+}
+
+// Open popup channels get a fresh status snapshot on connect. Future state changes are pushed.
+const popupPorts = new Set();
+async function buildStatusSnapshot() {
+  const probe = await probeBridge();
+  // Only fetch the control-plane status when the bridge is reachable. A failed probe
+  // would otherwise overwrite a previously-known good control value with `null`, and
+  // the popup would show "?" instead of the last reliable state.
+  let control = null;
+  if (probe && probe.ok) {
+    try {
+      const res = await fetch(`${BRIDGE_URL}/__pi_chrome_control?action=status`, { cache: "no-store" });
+      if (res.ok) {
+        const body = await res.json();
+        if (body && body.ok) control = body.result || null;
+      }
+    } catch {}
+  }
+  return {
+    type: "status",
+    state: connectionState,
+    companionVersion: chrome.runtime.getManifest().version,
+    bridgeUrl: BRIDGE_URL,
+    bridgeProbe: probe,
+    control,
+    lastSuccessAt: lastBridgeSuccessAt,
+    lastAuthAt: lastBridgeAuthAt,
+    lastError: lastBridgeError,
+    automationTargetCount: typeof automationTargets !== "undefined" ? automationTargets.size : 0,
+  };
+}
+async function broadcastStatus() {
+  const snapshot = await buildStatusSnapshot();
+  for (const port of popupPorts) {
+    try { port.postMessage(snapshot); } catch { popupPorts.delete(port); }
+  }
+}
+if (chrome.runtime && chrome.runtime.onConnect) {
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "popup") return;
+    popupPorts.add(port);
+    buildStatusSnapshot().then((snapshot) => {
+      try { port.postMessage(snapshot); } catch { popupPorts.delete(port); }
+    });
+    port.onDisconnect.addListener(() => { popupPorts.delete(port); });
+  });
+}
+// One-shot fallback for popup.getStatus requests. Useful when chrome.runtime.connect somehow
+// fails to wake the worker (mv3 keeps the worker suspended and onConnect sometimes returns
+// before the listener is registered after reload).
+// popups can close before an async response arrives, so a port-based snapshot can race.
+// The popup reads chrome.storage.session on open and renders synchronously. The worker
+// keeps pushing so the value is always fresh within PUSH_INTERVAL_MS.
+const POPUP_SNAPSHOT_KEY = "piChromePopupSnapshot";
+const PUSH_INTERVAL_MS = 2000;
+async function pushStatusToStorage() {
+  try {
+    const snapshot = await buildStatusSnapshot();
+    if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.set === "function") {
+      await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: snapshot });
+    }
+  } catch {
+    /* storage may be unavailable in some sandboxed contexts; never throw out of the timer. */
+  }
+}
+pushStatusToStorage(); // initial paint
+setInterval(pushStatusToStorage, PUSH_INTERVAL_MS);
+
+updateBadge(); // initial paint
+
 const BRIDGE_URL = "http://127.0.0.1:17318";
+
+// Forward a popup control request to omp's /__pi_chrome_control route. Returns the parsed
+// JSON body so the popup can show the result inline.
+async function popupControlRequest(action, extraParams = {}) {
+  const params = new URLSearchParams({ action, ...extraParams });
+  const url = `${BRIDGE_URL}/__pi_chrome_control?${params.toString()}`;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    const body = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+    if (chrome.storage?.session?.set) {
+      try { await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: await buildStatusSnapshot() }); } catch {}
+    }
+    return body;
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+// One-shot IPC for popup.* messages. Popup uses sendMessage as a fallback when
+// chrome.runtime.connect races against the popup closing.
+if (chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!msg || typeof msg !== "object") return false;
+    if (msg.type === "popup.getStatus" || msg.type === "popup.refresh") {
+      // Bypass the 1.5s probe cache on explicit refresh so the user sees a fresh read.
+      if (msg.type === "popup.refresh") {
+        lastBridgeProbe = null;
+        lastBridgeProbeAt = 0;
+      }
+      buildStatusSnapshot().then(async (snapshot) => {
+        if (msg.type === "popup.refresh" && chrome.storage?.session?.set) {
+          try { await chrome.storage.session.set({ [POPUP_SNAPSHOT_KEY]: snapshot }); } catch {}
+        }
+        sendResponse(snapshot);
+      });
+      return true;
+    }
+    if (msg.type === "popup.authorize" || msg.type === "popup.revoke" ||
+        msg.type === "popup.doctor" || msg.type === "popup.background" ||
+        msg.type === "popup.controlStatus") {
+      const extraParams = {};
+      if (msg.type === "popup.authorize" && msg.duration) extraParams.duration = msg.duration;
+      if (msg.type === "popup.background" && typeof msg.on === "boolean") extraParams.on = String(msg.on);
+      const action = ({
+        "popup.authorize": "authorize",
+        "popup.revoke": "revoke",
+        "popup.doctor": "doctor",
+        "popup.background": "background",
+        "popup.controlStatus": "status",
+      })[msg.type];
+      popupControlRequest(action, extraParams).then((body) => sendResponse(body));
+      return true;
+    }
+    return false;
+  });
+}
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
+
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const COMMAND_TIMEOUT_MS = 25_000;
@@ -164,39 +368,55 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   for (const t of automationTargets.values()) if (t.tabId === tabId) return true;
   return false;
 }
+// Initial URL for automation targets. Must be a real http(s) URL on an origin covered by
+// manifest host_permissions. We use the bridge origin itself (`http://127.0.0.1:17318`) which
+// the companion already trusts and which the bridge serves as a tiny `text/html` page with a
+// `<title>Pi Chrome</title>` shell. About:blank is unusable (host_permissions cannot cover
+// about: — Chrome treats it as opaque). Data: URLs are unusable too (chrome.scripting rejects
+// them even with `<all_urls>` because data: has no extension access for injection).
+// Chrome-extension: URLs (our own origin) are also rejected by chrome.scripting unless the
+// user has just interacted with the tab (activeTab flow). Chrome: / devtools: / edge: are
+// likewise blocked. The bridge route is the only universal option that does not require a
+// user click or a specific external page.
+const AUTOMATION_TARGET_URL = `${BRIDGE_URL}/__pi_chrome_shell`;
 
-// Create a fresh automation target for `sessionKey`. If this session already has a tab group,
-// create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
-// groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
-// tab. When the tab is created in a pre-existing group window, leave windowId unset so cleanup only
-// closes our tab, never that whole window.
 async function createAutomationTarget(sessionKey, groupTitle) {
-  const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
-  if (existingGroup && typeof existingGroup.windowId === "number") {
-    const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
-    automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
-    await persistAutomationTargets();
-    return tab;
-  }
-  if (chrome.windows && typeof chrome.windows.create === "function") {
-    try {
-      const win = await chrome.windows.create({ url: "about:blank", focused: false });
-      const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
-      if (created && typeof created.id === "number") {
-        automationTargets.set(sessionKey, { windowId: typeof win.id === "number" ? win.id : undefined, tabId: created.id });
-        await persistAutomationTargets();
-        return created;
-      }
-    } catch {
-      // Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
-    }
-  }
-  // Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
-  // must leave windowId unset — cleanup then closes only our tab, never the user's window.
-  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
-  automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
-  await persistAutomationTargets();
-  return tab;
+	const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
+	if (existingGroup && typeof existingGroup.windowId === "number") {
+		const tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false, windowId: existingGroup.windowId });
+		automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
+		await persistAutomationTargets();
+		return tab;
+	}
+	// Prefer reusing the user's currently-active window: open a background tab there instead of
+	// spawning a new Chrome window. We never replace the active tab — `active: false` keeps the
+	// user's selection intact, and background mode keeps the new tab out of focus. If the
+	// chrome.windows API is unavailable we fall through to the tab-only fallback below.
+	let activeWindowId;
+	if (chrome.windows && typeof chrome.windows.getCurrent === "function") {
+		try {
+			const win = await chrome.windows.getCurrent();
+			if (win && typeof win.id === "number") activeWindowId = win.id;
+		} catch {
+			// No current window (headless / detached) — leave activeWindowId undefined.
+		}
+	}
+	const createParams = { url: AUTOMATION_TARGET_URL, active: false };
+	if (typeof activeWindowId === "number") createParams.windowId = activeWindowId;
+	// Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
+	// must leave windowId unset on the automation record — cleanup then closes only our tab,
+	// never the user's window. If we passed a windowId above, chrome.tabs.create will fail with
+	// "Tabs cannot be edited right now (user may be dragging a tab)" on rare races — retry once
+	// without windowId to land the tab somewhere.
+	let tab;
+	try {
+		tab = await chrome.tabs.create(createParams);
+	} catch {
+		tab = await chrome.tabs.create({ url: AUTOMATION_TARGET_URL, active: false });
+	}
+	automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
+	await persistAutomationTargets();
+	return tab;
 }
 
 // Return the session's owned automation target if it still exists, else null. Robust to the user
@@ -1107,8 +1327,6 @@ function armKeepaliveAlarm() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.action.setBadgeText({ text: "pi" });
-  chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
   armKeepaliveAlarm();
   void pollLoop();
 });
@@ -1122,10 +1340,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "pi-bridge-keepalive") void pollLoop();
 });
 
-chrome.action.onClicked.addListener(() => {
-  armKeepaliveAlarm();
-  void pollLoop();
-});
+// Note: chrome.action.onClicked is intentionally NOT registered. The toolbar action opens the
+// popup (manifest action.default_popup) — the popup shows live status and a Doctor link.
 
 armKeepaliveAlarm();
 
@@ -1133,14 +1349,55 @@ setInterval(() => {
   void pollLoop();
 }, 1000);
 
+// Watchdog: every tick, run a fresh bridge probe and reconcile the connection state
+// against ground truth. We trust the probe result and the last /next success timestamp
+// together, but we run unconditionally — never short-circuit on the current state — so
+// the badge can recover from "offline" once the bridge comes back.
+//   - connected when the bridge is reachable (covers both fresh /next and idle periods)
+//   - offline only when probe failed AND no recent /next success within the window
+// The hybrid state (bridge reachable but no recent poll, OR bridge down but poll is
+// fresh) is intentionally left alone so the next /next tick resolves it without
+// flickering the toolbar LED on every idle window.
+const OFFLINE_AFTER_MS = 8_000;
+setInterval(() => {
+  // Trigger a fresh probe so the watchdog decision is based on ground truth, not a stale
+  // cache. We do NOT await — run the probe in parallel with the timestamp check.
+  probeBridge().then((probe) => {
+    const bridgeReachable = probe && probe.ok;
+    const recentlyPolled = lastBridgeSuccessAt && (Date.now() - lastBridgeSuccessAt) <= OFFLINE_AFTER_MS;
+    if (bridgeReachable) {
+      lastBridgeError = "";
+      setConnectionState("connected");
+    } else if (!recentlyPolled) {
+      lastBridgeError = `bridge unreachable · ${probe?.error || "no recent /next success"}`;
+      setConnectionState("offline");
+    }
+    // else: bridge down but /next is still fresh — leave the state alone, the next
+    // /next tick will resolve it.
+  });
+}, 2_000);
+
 async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
-        cache: "no-store",
-      });
+      let response;
+      try {
+        response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, { cache: "no-store" });
+      } catch (err) {
+        lastBridgeError = err?.message || String(err);
+        // Watchdog will flip to offline; await below still backs off.
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      }
+      if (response.status === 401 || response.status === 403) {
+        lastBridgeError = `bridge returned HTTP ${response.status}`;
+        lastBridgeAuthAt = Date.now();
+        setConnectionState("authorized");
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      }
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
@@ -1150,6 +1407,9 @@ async function pollLoop() {
         return;
       }
       const payload = await response.json();
+      lastBridgeSuccessAt = Date.now();
+      lastBridgeError = "";
+      setConnectionState("connected");
       if (payload.type === "command") await handleCommand(payload.command);
     }
   } catch (error) {
@@ -1482,11 +1742,10 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
       );
     }
   }
-  if (!tab?.id) throw new Error("No matching Chrome tab found");
-  const url = tab.url || "";
-  if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://")) {
-    throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}`);
-  }
+	const url = tab.url || "";
+	if (url.startsWith("about:") || url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://") || url.startsWith("edge://")) {
+		throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}. Navigate the tab to an http(s) URL and retry.`);
+	}
   // Tabs Pi interacts with (page.* actions) join this session's group so the user can see exactly
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
