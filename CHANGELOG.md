@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.16.0 — 2026-09-16
+
+- **Status popup UI consistency.** The `Automation Targets` stat now uses the `.value.accent` class so its number renders in the NVIDIA-green accent instead of falling back to plain text. Card alignment in the Connection panel uses `align-items: start` so the two-column grid stays balanced when one card has a probe line and the other does not.
+- **Bridge URL wrapping.** Replaced `word-break: break-all` with `break-word` plus `overflow-wrap: anywhere` on `.stat .value` so URLs break on slashes/dots instead of splitting a single token mid-character.
+- **Connection watchdog state.** `service_worker.probeBridge()` now updates `lastBridgeSuccessAt` on a successful probe. Previously, `state` could flip to `offline` even though the active `/status` probe showed `reachable`, because only `/next` long-polls fed the success timestamp.
+
 ## 0.15.51 — 2026-09-10
 
 - **Fewer Chrome commands.** Removed `/chrome status`; use bare `/chrome` for the quick connection, authorization, and background dashboard plus controls. The dashboard remains lightweight and does not run page probes.
