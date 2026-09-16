@@ -64,6 +64,9 @@ async function probeBridge() {
       error: res.ok ? "" : `HTTP ${res.status}`,
       url,
     };
+    // Successful probe also proves the bridge is reachable — feed the success timestamp
+    // so the watchdog sees an active bridge even when the /next long-poll is idle.
+    if (res.ok) lastBridgeSuccessAt = Date.now();
   } catch (e) {
     probe = {
       ok: false, status: 0, latencyMs: Date.now() - t0,

@@ -95,7 +95,7 @@
     background: linear-gradient(180deg, var(--nv-green), var(--nv-green-3));
   }
 
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
 
   .auth-row {
     display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;
@@ -159,9 +159,10 @@
   }
   .stat .value {
     margin-top: 4px; font-family: var(--font-mono); font-size: 13px; color: var(--text-1);
-    font-variant-numeric: tabular-nums; word-break: break-all;
+    font-variant-numeric: tabular-nums; word-break: break-word; overflow-wrap: anywhere;
   }
   .stat .value.mono { font-family: var(--font-mono); font-size: 12px; }
+  .stat .value.accent { color: var(--nv-green); font-weight: 600; }
 
   /* Inline health-probe result under the Bridge URL stat. */
   .probe {
