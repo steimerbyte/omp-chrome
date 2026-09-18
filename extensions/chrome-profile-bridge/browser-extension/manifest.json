@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Chrome Connector",
-  "version": "0.17.7",
+  "version": "0.17.8",
   "description": "Lets Pi control tabs in Chrome via a local connector at 127.0.0.1.",
   "permissions": [
     "tabs",
@@ -26,5 +26,6 @@
   "action": {
     "default_title": "Pi Chrome Connector",
     "default_popup": "ui/status.html"
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkzY4i5xYOTa6viNdmAu6UBze4aPqxYmgo21ZSxTZQycRQB2iUvY4MIc38Ok3aU2E1Ub6lMr2JR2RtnflN6gY/8QO4om7LyXle2InfDDSMNrhrJS55wxRcta++vryXz+nuSfC0aw7Gl4olR5RYF41qNhElVf5I+R/3rS/5yBUjMpPUZcUnHk+CdoCnamTRjxft6/hxu0UNk3Ukh38geVSg7G+1uGS4W/FgXzL10rzt3wvfCwepgj9TLYNzTjFIWxgKnt6hTzmMLLSO0YwF2/kzyQb0CP8Zpb6RSwcnroUE/llnpgcGkeH1uDsuUrMyg7Bm7TLLCA9WgHQUZE0JDBjSQIDAQAB"
 }

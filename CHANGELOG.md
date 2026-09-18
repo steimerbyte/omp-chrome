@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.17.8 — 2026-09-18
+
+- **`/chrome authorize` TUI selectable.** Bare `/chrome authorize` now opens a 4-option TUI: `15 minutes (default)`, `30 minutes`, `Indefinite`, `Custom minutes`. Plain Enter grants 15m; Esc cancels without changes. The CLI form (`/chrome authorize 30m`, `/chrome authorize indefinite`) still bypasses the menu and grants directly. Same TUI is shared with the `/chrome` top-menu "Authorize Chrome control…" entry.
+
 ## 0.17.7 — 2026-09-17
 
 - **chrome_type pre-RAF visibility gate.** Closes the race where the click-to-focus lands on an element transitioning in (opacity 0→1); first 1-3 typed characters were swallowed. After `resolveTargetInTab` and before the first `Input.dispatchMouseEvent`/`cdpTypeChar`, a single-sample check (offsetParent / display / visibility / opacity) gates dispatch; fast path skips the rAF when the element is already stable.

@@ -1602,11 +1602,36 @@ Usage rules:
 
 	const authorizeHandler = async (ctx: ExtensionContext, args: string) => {
 		const grant = parseAuthorizeArg(args);
-		if (!grant) {
-			ctx.ui.notify("Unknown authorize duration. Use minutes (15m, 30m, 45) or indefinite.", "warning");
-			return;
+		if (grant) {
+			// Direct call (e.g. `/chrome authorize indefinite` or `authorizeFor(ctx, "30m")` from
+			// the TUI menu). Skip the confirmation prompt.
+			return authorizeFor(ctx, grant.label, grant.until);
 		}
-		return authorizeFor(ctx, grant.label, grant.until);
+		// Interactive TUI: 15/30/indefinite/custom. Default option highlighted so plain Enter
+		// grants 15 minutes; Esc cancels. Selectable persists across re-entry so a user can
+		// adjust duration without typing minutes by hand.
+		while (true) {
+			const choice = await ctx.ui.select("Authorize Chrome control", [
+				"15 minutes (default)",
+				"30 minutes",
+				"Indefinite",
+				"Custom minutes",
+			]);
+			if (!choice) {
+				ctx.ui.notify("Chrome control remains locked.", "info");
+				return;
+			}
+			switch (choice) {
+				case "15 minutes (default)": return authorizeHandler(ctx, "15m");
+				case "30 minutes": return authorizeHandler(ctx, "30m");
+				case "Indefinite": return authorizeHandler(ctx, "indefinite");
+				case "Custom minutes": {
+					const value = await ctx.ui.input("Authorize for how many minutes?", "45");
+					if (!value) continue;
+					return authorizeHandler(ctx, value);
+				}
+			}
+		}
 	};
 
 	const revokeHandler = (ctx: ExtensionContext) => {
@@ -1699,16 +1724,20 @@ Usage rules:
 		}
 	}
 
-	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
+const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
 			const choice = await ctx.ui.select("Authorize Chrome control", [
-				"15 minutes",
+				"15 minutes (default)",
 				"30 minutes",
 				"Indefinite",
 				"Custom minutes",
 			]);
+			if (!choice) {
+				ctx.ui.notify("Chrome control remains locked.", "info");
+				return;
+			}
 			switch (choice) {
-				case "15 minutes": return authorizeHandler(ctx, "15m");
+				case "15 minutes (default)": return authorizeHandler(ctx, "15m");
 				case "30 minutes": return authorizeHandler(ctx, "30m");
 				case "Indefinite": return authorizeHandler(ctx, "indefinite");
 				case "Custom minutes": {
