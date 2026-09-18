@@ -53,6 +53,7 @@ function piHarness({ session = "alpha", send } = {}) {
   };
   const registrations = indexSource.slice(indexSource.indexOf("function registerChromeTools(pi:"), indexSource.lastIndexOf("\n}"));
   vm.runInNewContext(stripTypeScriptTypes([
+    "var lastActiveTabId; var lastSnapshotAt; const STALE_SNAPSHOT_MS = 5000; const noteSnapshotTaken = () => {}; const snapshotIsFresh = () => false; const rememberTabId = () => {};",
     section("const bridge = new ChromeProfileBridge(", "\n\tlet chromeAuthorizedUntil:"),
     section("const authorizedBridgeSend =", '\n\tpi.on("session_start",'),
     section("const BACKGROUND_DESC:", "\n\tconst authorizeFor ="),

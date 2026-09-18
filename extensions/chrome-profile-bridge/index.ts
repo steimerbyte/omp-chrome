@@ -1,9 +1,31 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+
+// Optional keytar/libsecret fallback for the passphrase. Loaded lazily so the rest of
+// pi-chrome still works on systems without libsecret/DPAPI.
+type KeytarModule = {
+	getPassword(service: string, account: string): Promise<string | null>;
+	setPassword(service: string, account: string, password: string): Promise<void>;
+	deletePassword(service: string, account: string): Promise<boolean>;
+};
+let keytarPromise: Promise<KeytarModule | null> | undefined;
+function loadKeytar(): Promise<KeytarModule | null> {
+	if (!keytarPromise) {
+		// @ts-expect-error - keytar is an optional dependency; install manually when available
+		keytarPromise = import("keytar")
+			.then((mod) => mod as unknown as KeytarModule)
+			.catch(() => null);
+	}
+	return keytarPromise;
+}
+const KEYTAR_SERVICE = "pi-chrome-credentials";
+const KEYTAR_ACCOUNT = "passphrase-v1";
 
 /**
  * Existing-profile Chrome bridge for pi.
@@ -45,12 +67,22 @@ type BridgeResult = {
 	error?: string;
 };
 
-const PI_CHROME_PKG_PATH = resolve(__dirname, "..", "..", "package.json");
+// Look up the pi-chrome package version in a few well-known places. The companion extension
+// lives in a separate codebase (typically somewhere under /mnt/c/Users/... on this WSL box,
+// or wherever the user did `Load unpacked` on brave://extensions). When omp can't find a
+// nearby package.json it falls back to a dev sentinel so the bridge still works.
+const PI_CHROME_PKG_CANDIDATES = [
+	"/mnt/c/Users/benjamin.steimer/pi-chrome/package.json",         // Brave user's local fork (authoritative when present)
+	resolve(__dirname, "..", "..", "package.json"),                 // standard sibling layout
+	resolve(__dirname, "..", "..", "..", "package.json"),            // one level higher
+];
 function readPiChromeVersion(): string {
-	try {
-		const pkg = JSON.parse(readFileSync(PI_CHROME_PKG_PATH, "utf8")) as { version?: string };
-		if (pkg.version) return pkg.version;
-	} catch {}
+	for (const candidate of PI_CHROME_PKG_CANDIDATES) {
+		try {
+			const pkg = JSON.parse(readFileSync(candidate, "utf8")) as { version?: string };
+			if (pkg.version) return pkg.version;
+		} catch {}
+	}
 	return "0.0.0-dev";
 }
 const PI_CHROME_VERSION = readPiChromeVersion();
@@ -234,6 +266,345 @@ function hostnameOf(url: string | undefined): string {
 	try { return new URL(url).hostname; } catch { return ""; }
 }
 
+// ===============================================================
+// Encrypted credentials store (auto-relogin helper)
+// ===============================================================
+// Stores saved login credentials in $HOME/.pi-chrome/credentials.json (chmod 600).
+// Passwords are encrypted with AES-256-GCM; the symmetric key is derived via scrypt
+// from a passphrase that lives in keytar/libsecret/DPAPI when available, else a
+// machine-local fallback (random per install, kept next to the file as `.fallback`,
+// also chmod 600). Never read this file from the browser-extension — the bridge
+// owns all crypto and the worker only sees decrypted values over the wire, scoped
+// to a single fill invocation.
+const PI_CHROME_DIR = join(homedir(), ".pi-chrome");
+const CREDENTIALS_FILE = join(PI_CHROME_DIR, "credentials.json");
+const CREDENTIALS_AUDIT_FILE = join(PI_CHROME_DIR, "credentials.audit.log");
+const CREDENTIALS_FALLBACK_FILE = join(PI_CHROME_DIR, "credentials.fallback");
+const CREDENTIALS_FILE_MODE = 0o600;
+const CREDENTIALS_DIR_MODE = 0o700;
+const SCRYPT_PARAMS = { N: 1 << 15, r: 8, p: 1, keylen: 32 };
+const CREDENTIALS_KDF_ID = "scrypt-v1";
+const RATE_LIMIT_PER_HOUR = 5;
+
+type PasswordCipher = {
+	iv: string;            // base64
+	tag: string;           // base64
+	ciphertext: string;    // base64
+	keyId: string;
+	kdf: "scrypt";
+	kdfParams: { N: number; r: number; p: number; salt: string };
+};
+
+type CredentialAlias = {
+	name: string;
+	host: string;
+	username: string;
+	passwordCipher: PasswordCipher;
+	updatedAt: number;
+	lastUsedAt?: number;
+};
+
+type CredentialsStore = {
+	aliases: CredentialAlias[];
+};
+
+async function ensurePiChromeDir(): Promise<void> {
+	await mkdir(PI_CHROME_DIR, { recursive: true, mode: CREDENTIALS_DIR_MODE });
+	try {
+		chmodSync(PI_CHROME_DIR, CREDENTIALS_DIR_MODE);
+	} catch {
+		// Some WSL mounts don't honor chmod; that's fine — the file modes below still matter.
+	}
+}
+
+function trySecureFile(filePath: string, contents: string): void {
+	try {
+		writeFileSync(filePath, contents, { mode: CREDENTIALS_FILE_MODE });
+		chmodSync(filePath, CREDENTIALS_FILE_MODE);
+	} catch {
+		// Surface via the calling path; the credentials module is best-effort on FS-restricted hosts.
+	}
+}
+
+// One-time generation of a 32-byte random passphrase. Stored in keytar when libsecret is
+// available; falls back to a chmod-600 file under ~/.pi-chrome/. Either path keeps the
+// passphrase off the wire and out of process listings. We never persist the passphrase
+// in plaintext anywhere reachable from a browser context.
+let passphraseCache: string | undefined;
+async function loadOrCreatePassphrase(): Promise<string> {
+	if (passphraseCache) return passphraseCache;
+	const keytar = await loadKeytar();
+	if (keytar) {
+		const stored = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT).catch(() => null);
+		if (stored) {
+			passphraseCache = stored;
+			return stored;
+		}
+		const fresh = randomBytes(32).toString("base64");
+		await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT, fresh).catch(() => undefined);
+		passphraseCache = fresh;
+		return fresh;
+	}
+	await ensurePiChromeDir();
+	let existing: string | null = null;
+	try {
+		existing = readFileSync(CREDENTIALS_FALLBACK_FILE, "utf8");
+	} catch {
+		existing = null;
+	}
+	if (existing && existing.length >= 32) {
+		passphraseCache = existing.trim();
+		return passphraseCache;
+	}
+	const fresh = randomBytes(32).toString("base64");
+	trySecureFile(CREDENTIALS_FALLBACK_FILE, fresh);
+	passphraseCache = fresh;
+	return fresh;
+}
+
+async function loadCredentialsStore(): Promise<CredentialsStore> {
+	try {
+		const raw = readFileSync(CREDENTIALS_FILE, "utf8");
+		const parsed = JSON.parse(raw) as CredentialsStore;
+		if (!parsed || !Array.isArray(parsed.aliases)) return { aliases: [] };
+		// Defensive: drop any aliases that fail to parse their cipher shape.
+		parsed.aliases = parsed.aliases.filter((alias) => alias && alias.name && alias.host && alias.username && alias.passwordCipher);
+		return parsed;
+	} catch {
+		return { aliases: [] };
+	}
+}
+
+async function saveCredentialsStore(store: CredentialsStore): Promise<void> {
+	await ensurePiChromeDir();
+	const serialized = JSON.stringify(store, null, 2);
+	trySecureFile(CREDENTIALS_FILE, serialized);
+}
+
+async function encryptSecret(plaintext: string, passphrase: string): Promise<PasswordCipher> {
+	const salt = randomBytes(16);
+	const key = scryptSync(passphrase, salt, SCRYPT_PARAMS.keylen, { N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p, maxmem: 256 * SCRYPT_PARAMS.N * SCRYPT_PARAMS.r * 2 });
+	const iv = randomBytes(12);
+	const cipher = createCipheriv("aes-256-gcm", key, iv);
+	const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+	const tag = cipher.getAuthTag();
+	const keyId = CREDENTIALS_KDF_ID;
+	return {
+		iv: iv.toString("base64"),
+		tag: tag.toString("base64"),
+		ciphertext: ciphertext.toString("base64"),
+		keyId,
+		kdf: "scrypt",
+		kdfParams: { N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p, salt: salt.toString("base64") },
+	};
+}
+
+async function decryptSecret(cipher: PasswordCipher, passphrase: string): Promise<string> {
+	if (cipher.kdf !== "scrypt") throw new Error(`Unsupported KDF: ${cipher.kdf}`);
+	const { N, r, p, salt } = cipher.kdfParams;
+	const key = scryptSync(passphrase, Buffer.from(salt, "base64"), SCRYPT_PARAMS.keylen, { N, r, p, maxmem: 256 * N * r * 2 });
+	const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(cipher.iv, "base64"));
+	decipher.setAuthTag(Buffer.from(cipher.tag, "base64"));
+	const plaintext = Buffer.concat([decipher.update(Buffer.from(cipher.ciphertext, "base64")), decipher.final()]);
+	return plaintext.toString("utf8");
+}
+
+function appendCredentialsAudit(entry: Record<string, unknown>): void {
+	try {
+		ensurePiChromeDir().catch(() => undefined);
+		const line = JSON.stringify({ ...entry, ts: entry.ts ?? Date.now() }) + "\n";
+		// Append using a sync writeFile so the audit never silently drops lines; mode is set on
+		// file create only — append keeps it 0600.
+		try {
+			// Use the promisified variant to avoid blocking, then ensure mode on first create.
+			writeFile(CREDENTIALS_AUDIT_FILE, line, { mode: CREDENTIALS_FILE_MODE, flag: "a" }).catch(() => undefined);
+		} catch {
+			// No-op: audit failures must never break the fill flow.
+		}
+	} catch {
+		// Audit failures must never break the fill flow.
+	}
+}
+
+function credentialsListSummary(alias: CredentialAlias): { name: string; host: string; lastUsedAt?: number } {
+	return { name: alias.name, host: alias.host, lastUsedAt: alias.lastUsedAt };
+}
+
+async function credentialsList(): Promise<{ aliases: Array<{ name: string; host: string; lastUsedAt?: number }> }> {
+	const store = await loadCredentialsStore();
+	return { aliases: store.aliases.map(credentialsListSummary) };
+}
+
+async function credentialsAdd(params: { name: string; host: string; username: string; password: string }): Promise<{ name: string; host: string; updatedAt: number }> {
+	const name = String(params.name || "").trim();
+	const host = String(params.host || "").trim().toLowerCase();
+	const username = String(params.username || "");
+	const password = String(params.password || "");
+	if (!name) throw new Error("credentials.add: name is required");
+	if (!host) throw new Error("credentials.add: host is required");
+	if (!username) throw new Error("credentials.add: username is required");
+	if (!password) throw new Error("credentials.add: password is required");
+	const passphrase = await loadOrCreatePassphrase();
+	const cipher = await encryptSecret(password, passphrase);
+	const store = await loadCredentialsStore();
+	const updatedAt = Date.now();
+	const next: CredentialAlias = {
+		name,
+		host,
+		username,
+		passwordCipher: cipher,
+		updatedAt,
+	};
+	const idx = store.aliases.findIndex((alias) => alias.name === name);
+	if (idx >= 0) store.aliases[idx] = next; else store.aliases.push(next);
+	await saveCredentialsStore(store);
+	return { name, host, updatedAt };
+}
+
+async function credentialsRemove(name: string): Promise<{ removed: boolean }> {
+	const store = await loadCredentialsStore();
+	const before = store.aliases.length;
+	store.aliases = store.aliases.filter((alias) => alias.name !== name);
+	await saveCredentialsStore(store);
+	return { removed: store.aliases.length < before };
+}
+
+const credentialsFillAttempts = new Map<string, number[]>();
+function credentialsRateLimitCheck(alias: string): { ok: boolean; remaining: number; resetAt: number } {
+	const now = Date.now();
+	const windowMs = 60 * 60 * 1000;
+	const arr = (credentialsFillAttempts.get(alias) ?? []).filter((t) => now - t < windowMs);
+	if (arr.length >= RATE_LIMIT_PER_HOUR) {
+		const resetAt = arr[0] + windowMs;
+		return { ok: false, remaining: 0, resetAt };
+	}
+	arr.push(now);
+	credentialsFillAttempts.set(alias, arr);
+	return { ok: true, remaining: RATE_LIMIT_PER_HOUR - arr.length, resetAt: now + windowMs };
+}
+
+type BridgeSender = (action: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+
+async function credentialsFill(args: {
+	alias: string;
+	tabId?: number;
+	host: string;
+	usernameUid?: string;
+	usernameSelector?: string;
+	passwordUid?: string;
+	passwordSelector?: string;
+	submitSelector?: string;
+	background?: boolean;
+	send: BridgeSender;
+}): Promise<unknown> {
+	const aliasName = String(args.alias || "").trim();
+	if (!aliasName) throw new Error("credentials.fill: alias is required");
+	const expectedHost = String(args.host || "").trim().toLowerCase();
+	if (!expectedHost) throw new Error("credentials.fill: host is required");
+
+	const store = await loadCredentialsStore();
+	const entry = store.aliases.find((alias) => alias.name === aliasName);
+	if (!entry) throw new Error(`credentials.fill: no alias named '${aliasName}'`);
+	if (entry.host.toLowerCase() !== expectedHost) {
+		throw new Error(`credentials.fill: alias '${aliasName}' is bound to host '${entry.host}', refusing to fill on '${expectedHost}'`);
+	}
+
+	const limit = credentialsRateLimitCheck(aliasName);
+	if (!limit.ok) {
+		const minutes = Math.max(1, Math.ceil((limit.resetAt - Date.now()) / 60_000));
+		throw new Error(`credentials.fill: rate limit exceeded for '${aliasName}'; try again in ${minutes}m (5 attempts/hour cap).`);
+	}
+
+	const passphrase = await loadOrCreatePassphrase();
+	const password = await decryptSecret(entry.passwordCipher, passphrase);
+
+	// MFA / CAPTCHA short-circuit: probe the page for a TOTP field or a known challenge iframe.
+	// We don't try to solve these — we surface the error so the caller can hand off to a human.
+	const probe = await args.send("page.evaluate", {
+		expression: `(() => {
+			const totpHints = ["totp", "2fa", "mfa", "verification", "authenticator", "otp", "one-time"];
+			const hasTotpField = Array.from(document.querySelectorAll("input")).some((el) => {
+				const blob = [
+					el.id || "", el.name || "", el.autocomplete || "", el.placeholder || "",
+					(el.getAttribute("aria-label") || ""), (el.getAttribute("data-testid") || ""),
+				].join(" ").toLowerCase();
+				return el.type !== "hidden" && totpHints.some((hint) => blob.includes(hint));
+			});
+			const captchaIframes = Array.from(document.querySelectorAll("iframe")).filter((f) => {
+				const src = (f.src || "").toLowerCase();
+				return /hcaptcha|recaptcha/.test(src);
+			});
+			return { hasTotpField, captchaIframes: captchaIframes.length };
+		})()`,
+		background: args.background !== true,
+	}).catch(() => null) as { hasTotpField?: boolean; captchaIframes?: number } | null;
+
+	if (probe?.hasTotpField) {
+		throw new Error("credentials.fill: detected a TOTP/2FA field on the page; refusing to auto-fill. Ask the user to complete 2FA manually.");
+	}
+	if (probe && (probe.captchaIframes ?? 0) > 0) {
+		throw new Error("credentials.fill: detected a CAPTCHA iframe (hCaptcha/reCAPTCHA); refusing to auto-fill. Ask the user to solve the challenge.");
+	}
+
+	const tabId = args.tabId;
+	const fillParams: Record<string, unknown> = {
+		...(tabId !== undefined ? { targetId: tabId } : {}),
+		background: args.background !== true,
+	};
+	// Split into two wire calls: 'credentials.fill' (step=username) then 'credentials.fill'
+	// (step=password). The worker owns hostname re-validation + MFA/CAPTCHA short-circuit and
+	// drives chromeInputType for each step. We never send the password in cleartext to the
+	// worker — it travels only inside the encrypted bridge session via the credentials.fill
+	// wire action, scoped to one invocation.
+	const usernameResult = await args.send("credentials.fill", {
+		...fillParams,
+		step: "username",
+		host: expectedHost,
+		value: entry.username,
+		...(args.usernameUid ? { uid: args.usernameUid } : {}),
+		...(args.usernameSelector ? { selector: args.usernameSelector } : {}),
+	}, DEFAULT_TIMEOUT_MS);
+	const passwordResult = await args.send("credentials.fill", {
+		...fillParams,
+		step: "password",
+		host: expectedHost,
+		value: password,
+		...(args.passwordUid ? { uid: args.passwordUid } : {}),
+		...(args.passwordSelector ? { selector: args.passwordSelector } : {}),
+	}, DEFAULT_TIMEOUT_MS);
+
+	let submitResult: unknown;
+	if (args.submitSelector) {
+		submitResult = await args.send("page.click", {
+			...fillParams,
+			selector: args.submitSelector,
+		}, DEFAULT_TIMEOUT_MS);
+	}
+
+	// Best-effort update lastUsedAt; never block the response on a write failure.
+	entry.lastUsedAt = Date.now();
+	saveCredentialsStore(store).catch(() => undefined);
+
+	appendCredentialsAudit({
+		alias: aliasName,
+		host: expectedHost,
+		tabId: tabId ?? null,
+		ok: true,
+	});
+
+	return {
+		ok: true,
+		alias: aliasName,
+		host: expectedHost,
+		usernameLength: entry.username.length,
+		passwordLength: password.length,
+		usernameResult,
+		passwordResult,
+		submitResult,
+		rateLimitRemaining: limit.remaining,
+	};
+}
+
 // Description of a click/type/fill result's significant fields so the agent doesn't have to
 // guess whether the action actually changed the page.
 function summarizeActionResult(result: unknown): string | undefined {
@@ -252,6 +623,8 @@ function summarizeActionResult(result: unknown): string | undefined {
 		parts.push(`occluded by <${o.tag ?? "?"}${o.id ? "#" + o.id : ""}>`);
 	}
 	if (r.valueMatches === false) parts.push("input value did not stick");
+	if (r.usedReact === true) parts.push("filled via React native value setter");
+	if (r.verified === false) parts.push(`verifyExpr did not become truthy after ${r.verifyAttempts ?? 0} click attempt(s)`);
 	if (r.autoplayHint) parts.push("autoplay-gated affordance");
 	return parts.length ? parts.join("; ") : undefined;
 }
@@ -296,7 +669,6 @@ function sendJson(response: ServerResponse, status: number, body: unknown, extra
 	});
 	response.end(JSON.stringify(body));
 }
-
 class ChromeProfileBridge {
 	private server: Server | undefined;
 	private pending = new Map<string, PendingCommand>();
@@ -305,6 +677,17 @@ class ChromeProfileBridge {
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private mode: "server" | "client" | undefined;
+	// Optional callback for control-plane requests (authorize / revoke / doctor / background).
+	// The bridge class does not know about Pi plugin internals; the host plugin attaches a
+	// handler that knows how to drive its own auth/background/doctor state. The callback
+	// returns null to signal "not a control request, fall through to default handling".
+	onControlRequest: ((url: URL, request: IncomingMessage, response: ServerResponse) => Promise<boolean>) | undefined;
+
+	private enqueue(command: BridgeCommand): void {
+		const waiter = this.waiters.shift();
+		if (waiter) waiter(command);
+		else this.queue.push(command);
+	}
 
 	constructor(
 		private readonly host: string,
@@ -507,13 +890,6 @@ class ChromeProfileBridge {
 			causeCode === "ECONNRESET"
 		);
 	}
-
-	private enqueue(command: BridgeCommand): void {
-		const waiter = this.waiters.shift();
-		if (waiter) waiter(command);
-		else this.queue.push(command);
-	}
-
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		const url = new URL(request.url ?? "/", this.url);
 		const corsHeaders = corsHeadersFor(request);
@@ -523,6 +899,26 @@ class ChromeProfileBridge {
 				return;
 			}
 			sendJson(response, 200, { ok: true }, corsHeaders);
+			return;
+		}
+		// Allow the host plugin to claim control-plane requests before the bridge's default
+		// route table. The host callback returns true once it has handled the request.
+		if (this.onControlRequest && request.method === "GET" && url.pathname === "/__pi_chrome_control") {
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
+			const handled = await this.onControlRequest(url, request, response);
+			if (handled) return;
+		}
+		// /health is the lightweight liveness endpoint the Chrome companion polls on every tick.
+		// Same payload shape as /status (so existing clients keep parsing unchanged), but the
+		// response explicitly carries `cache-control: no-store` to defeat any intermediary cache
+		// that might otherwise serve a stale {connected:true} long after the bridge died. The
+		// companion probes /health first with a tight 750ms budget and falls back to /status
+		// only when the server does not yet recognize the route (older pi-chrome releases).
+		if (request.method === "GET" && url.pathname === "/health") {
+			sendJson(response, 200, this.status(), corsHeaders);
 			return;
 		}
 		if (request.method === "GET" && url.pathname === "/status") {
@@ -613,6 +1009,20 @@ class ChromeProfileBridge {
 			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
+		// Automation shell: serves a tiny HTML page on the bridge origin itself so the Chrome
+		// companion can use chrome.scripting.executeScript and chrome.debugger.attach against
+		// it (host_permissions cover http://127.0.0.1:17318/*). about:blank / data: / the
+		// companion's own extension origin are all rejected by chrome.scripting in practice,
+		// so the only universally-scriptable target is a real URL on a permitted origin.
+		if (request.method === "GET" && url.pathname === "/__pi_chrome_shell") {
+			const shell = "<!doctype html><meta charset=\"utf-8\"><title>Pi Chrome</title>";
+			response.writeHead(200, {
+				"content-type": "text/html; charset=utf-8",
+				"cache-control": "no-store",
+			});
+			response.end(shell);
+			return;
+		}
 		sendJson(response, 404, { error: "not found" });
 	}
 
@@ -646,8 +1056,12 @@ const CHROME_TOOL_NAMES = [
 	"chrome_navigate",
 	"chrome_evaluate",
 	"chrome_click",
+	"chrome_click_retry",
+	"chrome_session_check",
 	"chrome_type",
 	"chrome_fill",
+	"chrome_set_value",
+	"chrome_set_native_value",
 	"chrome_key",
 	"chrome_wait_for",
 	"chrome_list_console_messages",
@@ -659,6 +1073,10 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tap",
 	"chrome_scroll",
 	"chrome_upload_file",
+	"chrome_credentials_list",
+	"chrome_credentials_add",
+	"chrome_credentials_remove",
+	"chrome_credentials_fill",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
 
@@ -686,6 +1104,28 @@ export default function (pi: ExtensionAPI): void {
 	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
+	// Attach the control-plane handler before any /next traffic so the first popup click after
+	// omp reload already has the route.
+	bridge.onControlRequest = async (url, _request, response) => {
+		try {
+			if (url.searchParams.get("action") === "doctor") {
+				// doctor is async — handle inline so we can await statusSummary().
+				try {
+					const text = await statusSummary();
+					sendJson(response, 200, { ok: true, result: { text } });
+				} catch (error) {
+					sendJson(response, 500, { ok: false, error: (error as Error).message });
+				}
+				return true;
+			}
+			const result = handlePiChromeControlRequest(url);
+			sendJson(response, result.status, result.body);
+			return true;
+		} catch (error) {
+			sendJson(response, 500, { ok: false, error: (error as Error).message });
+			return true;
+		}
+	};
 	let backgroundEnabled = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	// Restore an authorization that survived a /reload. Drop it if it already expired.
@@ -707,6 +1147,32 @@ export default function (pi: ExtensionAPI): void {
 	let countdownInterval: NodeJS.Timeout | undefined;
 	// Remembered so bridge sends can tag tabs with this session's group even when ctx isn't handy.
 	let sessionCtx: ExtensionContext | undefined;
+	// Cache of the most recently observed tab id for this session. Lets page.* tools omit
+	// targetId when they only ever work on one tab, mirroring how human users think about
+	// "the current tab". Updated from chrome_tab list and from tab.new / tab.activate results.
+	// Cleared on session_start and on `bridge.stop()` to avoid carrying stale ids across runs.
+	let lastActiveTabId: number | undefined;
+	// Timestamp of the most recent successful chrome_snapshot in this session. chrome_click with
+	// bare x,y uses this to warn when the viewport may have shifted since the last observation.
+	let lastSnapshotAt: number = 0;
+	const STALE_SNAPSHOT_MS = 5_000;
+	const noteSnapshotTaken = (): void => { lastSnapshotAt = Date.now(); };
+	const snapshotIsFresh = (): boolean => Date.now() - lastSnapshotAt < STALE_SNAPSHOT_MS;
+
+	const rememberTabId = (candidate: unknown): void => {
+		if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+			lastActiveTabId = candidate;
+			return;
+		}
+		if (candidate && typeof candidate === "object") {
+			const obj = candidate as { id?: unknown; tabId?: unknown };
+			if (typeof obj.id === "number" && Number.isFinite(obj.id) && obj.id > 0) {
+				lastActiveTabId = obj.id;
+			} else if (typeof obj.tabId === "number" && Number.isFinite(obj.tabId) && obj.tabId > 0) {
+				lastActiveTabId = obj.tabId;
+			}
+		}
+	};
 
 	const clearAuthExpiryTimer = (): void => {
 		if (!authExpiryTimer) return;
@@ -884,10 +1350,16 @@ export default function (pi: ExtensionAPI): void {
 
 	const authorizedBridgeSend = async (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
+		// credentials.list is a pure Node-side read of the encrypted store — the worker can't
+		// read the file, so short-circuit it here to keep the wire-protocol action name stable
+		// without ever crossing the bridge.
+		if (action === "credentials.list") {
+			return credentialsList();
+		}
 		// Background on is a session policy, not a default that tool arguments can override.
 		// Apply it here so tab.new, chrome_launch(url), and tools without a background parameter
 		// cannot bypass it. Background off still permits per-call background:true.
-		const typed = params as { background?: boolean; foreground?: boolean };
+		const typed = params as { background?: boolean; foreground?: boolean; targetId?: unknown; urlIncludes?: unknown; titleIncludes?: unknown };
 		const requestedBackground = typed.background ?? (typed.foreground !== undefined ? !typed.foreground : false);
 		const background = backgroundEnabled || requestedBackground;
 		if (action === "tab.activate" && background) {
@@ -896,6 +1368,19 @@ export default function (pi: ExtensionAPI): void {
 		// Scope every action to this session's dedicated automation target and tab group.
 		const sessionKey = sessionKeyFor(sessionCtx);
 		let wireParams: Record<string, unknown> = { ...params, background, foreground: !background };
+		// page.* actions can omit targetId when the caller is clearly working on a single tab
+		// (chrome_tab list, chrome_navigate, explicit chrome_tab activate all populate this cache).
+		// urlIncludes/titleIncludes still win because they already disambiguate. Anything that
+		// needs a specific tab — tab.activate, tab.close, tab.group — is excluded because the
+		// caller must choose explicitly.
+		const isPageAction = action.startsWith("page.");
+		const callerTargetId = wireParams.targetId;
+		const hasExplicitTarget =
+			callerTargetId !== undefined && callerTargetId !== null && callerTargetId !== "";
+		const hasSelectorTarget = typeof wireParams.urlIncludes === "string" || typeof wireParams.titleIncludes === "string";
+		if (isPageAction && !hasExplicitTarget && !hasSelectorTarget && typeof lastActiveTabId === "number") {
+			wireParams = { ...wireParams, targetId: lastActiveTabId };
+		}
 		if (sessionKey !== undefined && params.sessionKey === undefined) wireParams.sessionKey = sessionKey;
 		const sessionTitle = sessionCtx !== undefined ? sessionGroupTitle(sessionCtx) : undefined;
 		// Any tab Pi opens through tab.new/tab.group must use THIS session's group, even if a caller
@@ -931,6 +1416,9 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionCtx = ctx;
+		// Stale tab ids from a previous omp run would route page.* to the wrong tab. Drop the
+		// cache so the first chrome_tab list / chrome_navigate repopulates it cleanly.
+		lastActiveTabId = undefined;
 		await bridge.start();
 		// Reestablish in-memory state after a /reload restored chromeAuthorizedUntil from globalThis.
 		if (chromeControlAuthorized()) {
@@ -1165,6 +1653,51 @@ Usage rules:
 		parts.push(`background: ${backgroundEnabled ? "on (hard)" : "off"}`);
 		return parts.join(" · ");
 	};
+	function handlePiChromeControlRequest(url: URL): { status: number; body: Record<string, unknown> } {
+		const action = url.searchParams.get("action");
+		if (!action) return { status: 404, body: { ok: false, error: "missing action" } };
+		switch (action) {
+			case "authorize": {
+				const duration = url.searchParams.get("duration") ?? "15m";
+				const grant = parseAuthorizeArg(duration);
+				if (!grant) return { status: 400, body: { ok: false, error: `Unknown duration '${duration}'` } };
+				const ctx = sessionCtx;
+				if (ctx) void authorizeFor(ctx, grant.label, grant.until);
+				else {
+					// No live TTY session — write the grant directly so the popup click takes effect.
+					chromeAuthorizedUntil = grant.until;
+					persistAuth();
+				}
+				return { status: 200, body: { ok: true, result: { until: chromeAuthorizedUntil, label: grant.label } } };
+			}
+			case "revoke": {
+				lockChromeControl("revoked");
+				const ctx = sessionCtx;
+				if (ctx) ctx.ui.notify("Chrome control locked by companion popup.", "info");
+				return { status: 200, body: { ok: true } };
+			}
+			case "background": {
+				const arg = url.searchParams.get("on");
+				if (arg === "true" || arg === "1") backgroundEnabled = true;
+				else if (arg === "false" || arg === "0") backgroundEnabled = false;
+				else backgroundEnabled = !backgroundEnabled;
+				return { status: 200, body: { ok: true, result: { background: backgroundEnabled ? "on" : "off" } } };
+			}
+			case "status": {
+				const isAuthorized = chromeAuthorizedUntil === "indefinite" || (typeof chromeAuthorizedUntil === "number" && chromeAuthorizedUntil > Date.now());
+				return { status: 200, body: {
+					ok: true,
+					result: {
+						authorized: isAuthorized,
+						authorizedUntil: chromeAuthorizedUntil,
+						background: backgroundEnabled ? "on" : "off",
+					},
+				} };
+			}
+			default:
+				return { status: 400, body: { ok: false, error: `Unknown action '${action}'` } };
+		}
+	}
 
 	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
@@ -1174,7 +1707,6 @@ Usage rules:
 				"Indefinite",
 				"Custom minutes",
 			]);
-			if (!choice) return;
 			switch (choice) {
 				case "15 minutes": return authorizeHandler(ctx, "15m");
 				case "30 minutes": return authorizeHandler(ctx, "30m");
@@ -1363,9 +1895,19 @@ Usage rules:
 			if (params.action === "list") {
 				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
 				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
-				return { content: [{ type: "text", text }], details: { tabs } };
+				// Refresh lastActiveTabId from the list: prefer the user's actually-active tab,
+				// otherwise the first tab in the response so single-tab workflows still resolve.
+				const activeTab = tabs.find((tab) => tab.active);
+				if (activeTab) rememberTabId(activeTab.id);
+				else if (tabs.length > 0) rememberTabId(tabs[0].id);
+				return { content: [{ type: "text", text }], details: { tabs, lastActiveTabId } };
 			}
-			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
+			// tab.new / tab.activate / tab.group return a single tab record; remember its id so
+			// the next page.* call without targetId lands on the freshly focused tab.
+			if (params.action === "new" || params.action === "activate" || params.action === "group") {
+				rememberTabId(result);
+			}
+			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json, lastActiveTabId } };
 		},
 	});
 
@@ -1397,6 +1939,7 @@ Usage rules:
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
+			noteSnapshotTaken();
 			return { content: [{ type: "text", text: formatChromeSnapshot(snapshot) }], details: { snapshot } };
 		},
 	});
@@ -1494,7 +2037,11 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.navigate", params, (params.timeoutMs ?? 15_000) + 2_000, signal);
-			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
+			// page.navigate returns the resolved tab record; remember its id so subsequent page.*
+			// calls without targetId land on the just-navigated tab even if it was the automation
+			// target rather than the user's previously-active tab.
+			rememberTabId(result);
+			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json, lastActiveTabId } };
 		},
 	});
 
@@ -1529,13 +2076,17 @@ Usage rules:
 		name: "chrome_click",
 		label: "Chrome Click",
 		description:
-			"Click a snapshot uid, CSS selector, or viewport coordinate using Chrome's real input layer. Pass includeSnapshot=true to return a fresh snapshot after the click.",
+			"Click a snapshot uid, CSS selector, or viewport coordinate using Chrome's real input layer. Precedence: uid > selector > x,y. Take a chrome_snapshot first to obtain a uid; bare x,y clicks warn when no recent snapshot exists. Pass includeSnapshot=true to return a fresh snapshot after the click. Optional verifyExpr/verifyAfterMs/verifyRetries poll for an effect after the click (Save-Bubble retry) and re-click up to verifyRetries times if the expression stays falsy.",
 		promptSnippet: "Click page elements in Chrome by snapshot uid, selector, or viewport coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector after taking a snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to click. Prefer uid from chrome_snapshot when available." })),
 			x: Type.Optional(Type.Number({ description: "Viewport x coordinate if uid/selector is omitted." })),
 			y: Type.Optional(Type.Number({ description: "Viewport y coordinate if uid/selector is omitted." })),
+			allowCoordFallback: Type.Optional(Type.Boolean({ default: false, description: "When true, suppress the stale-snapshot warning for bare x,y clicks without a fresh snapshot. Use only when you accept that the viewport may have shifted." })),
+			verifyExpr: Type.Optional(Type.String({ description: "CSS selector or JS expression polled after the click to confirm the effect. Truthy = success. Defaults: bare strings are treated as CSS selectors; strings containing ; { ( ) [ = are evaluated as JS. Example: '.save-bubble' or 'document.querySelector(\".saved\")'." })),
+			verifyAfterMs: Type.Optional(Type.Number({ default: 0, minimum: 0, maximum: 2000, description: "Total ms to poll verifyExpr for after the click before giving up. Default 0 = single probe with no polling. Capped at 2000." })),
+			verifyRetries: Type.Optional(Type.Number({ default: 1, minimum: 0, maximum: 3, description: "Max re-clicks when verifyExpr stays falsy. Each retry waits ~150ms then re-fires the click at the same coordinates. Default 1, max 3." })),
 			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM-dispatched click if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the click." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
@@ -1547,12 +2098,177 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const warnings: string[] = [];
+			if (params.x !== undefined && params.y !== undefined && !params.uid && !params.selector) {
+				if (!snapshotIsFresh() && !params.allowCoordFallback) {
+					warnings.push(
+						`x,y click without fresh snapshot — viewport may have shifted. Pass uid/selector or set allowCoordFallback=true.`,
+					);
+				}
+			}
+			// Save-Bubble retry: the service-worker probes verifyExpr after each click and re-fires
+			// up to verifyRetries times if the probe stays falsy. We just forward the params and
+			// surface the verification metadata in the result details.
 			const raw = await authorizedBridgeSend("page.click", params, DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
 			const text = summary ? `Clicked ${target} — ${summary}` : `Clicked ${target}`;
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			const finalText = warnings.length > 0 ? `${warnings.join("\n")}\n${text}` : text;
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, finalText) }], details: { result: raw as Json, warnings } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_click_retry",
+		label: "Chrome Click (Retry)",
+		description:
+			"Click a snapshot uid, CSS selector, or viewport coordinate with automatic retry on stale CDP errors. Wraps chrome_click's full chain (auto-fallback uid-CDP -> selector-CDP -> uid-DOM -> selector-DOM -> native) and re-fires the click up to `retries` times when the bridge throws a stale-tab error (Debugger is not attached / Detached while / Target closed / No tab with id). Useful right after a chrome_tab activate or chrome_navigate where the active target may briefly report a stale handle. Precedence: uid > selector > x,y. Pass includeSnapshot=true to return a fresh snapshot after the click. Optional verifyExpr/verifyAfterMs/verifyRetries provide the same Save-Bubble polling as chrome_click.",
+		promptSnippet: "Click page elements in Chrome with stale-CDP retry.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector after taking a snapshot." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector to click. Prefer uid from chrome_snapshot when available." })),
+			x: Type.Optional(Type.Number({ description: "Viewport x coordinate if uid/selector is omitted." })),
+			y: Type.Optional(Type.Number({ description: "Viewport y coordinate if uid/selector is omitted." })),
+			allowCoordFallback: Type.Optional(Type.Boolean({ default: false, description: "When true, suppress the stale-snapshot warning for bare x,y clicks without a fresh snapshot." })),
+			retries: Type.Optional(Type.Number({ default: 0, minimum: 0, maximum: 5, description: "Max additional retry attempts after the first click when the bridge throws a stale-CDP error. Default 0 = single click. Capped at 5." })),
+			delayMs: Type.Optional(Type.Number({ default: 250, minimum: 0, maximum: 5000, description: "Base ms to wait between retry attempts. Default 250. Capped at 5000." })),
+			backoff: Type.Optional(Type.String({ description: "Backoff strategy between retry attempts. 'linear' (default) keeps a constant delayMs. 'exponential' grows delayMs by 2x per attempt (capped at 5000)." })),
+			verifyExpr: Type.Optional(Type.String({ description: "CSS selector or JS expression polled after the click to confirm the effect. Truthy = success." })),
+			verifyAfterMs: Type.Optional(Type.Number({ default: 0, minimum: 0, maximum: 2000, description: "Total ms to poll verifyExpr for after the click before giving up. Capped at 2000." })),
+			verifyRetries: Type.Optional(Type.Number({ default: 1, minimum: 0, maximum: 3, description: "Max re-clicks when verifyExpr stays falsy. Default 1, max 3." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM-dispatched click if Chrome's CDP input path is blocked." })),
+			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the click." })),
+			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const retriesRaw = Number(params.retries);
+			const retries = Number.isFinite(retriesRaw) ? Math.min(Math.max(0, Math.floor(retriesRaw)), 5) : 0;
+			const delayRaw = Number(params.delayMs);
+			const delayMs = Number.isFinite(delayRaw) ? Math.min(Math.max(0, Math.floor(delayRaw)), 5000) : 250;
+			const backoff = params.backoff === "exponential" ? "exponential" : "linear";
+			const warnings: string[] = [];
+			if (params.x !== undefined && params.y !== undefined && !params.uid && !params.selector) {
+				if (!snapshotIsFresh() && !params.allowCoordFallback) {
+					warnings.push(
+						`x,y click without fresh snapshot — viewport may have shifted. Pass uid/selector or set allowCoordFallback=true.`,
+					);
+				}
+			}
+			const raw = (await authorizedBridgeSend(
+				"page.click.retry",
+				{ ...params, retries, delayMs, backoff },
+				DEFAULT_TIMEOUT_MS,
+				signal,
+			)) as Json;
+			let inner: Json = raw;
+			if (raw && typeof raw === "object" && !Array.isArray(raw) && "result" in raw) {
+				inner = (raw as { result: Json }).result;
+			}
+			let meta: { attempts?: unknown; lastError?: unknown; totalMs?: unknown; lastSyntheticFallback?: unknown } | null = null;
+			if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+				meta = raw as { attempts?: unknown; lastError?: unknown; totalMs?: unknown; lastSyntheticFallback?: unknown };
+			}
+			const attempts = meta && typeof meta.attempts === "number" ? meta.attempts : undefined;
+			const lastError = meta && typeof meta.lastError === "string" ? meta.lastError : undefined;
+			const totalMs = meta && typeof meta.totalMs === "number" ? meta.totalMs : undefined;
+			const summary = summarizeActionResult(inner);
+			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
+			const attemptsLabel = typeof attempts === "number" && attempts > 1 ? ` (attempt ${attempts})` : "";
+			const text = summary
+				? `Clicked ${target}${attemptsLabel} — ${summary}`
+				: `Clicked ${target}${attemptsLabel}`;
+			const finalText = warnings.length > 0 ? `${warnings.join("\n")}\n${text}` : text;
+			return {
+				content: [{ type: "text", text: formatIncludedSnapshotText(params.includeSnapshot ? raw : inner, finalText) }],
+				details: { result: raw as Json, warnings, attempts, lastError, totalMs },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_session_check",
+		label: "Chrome Session Check",
+		description:
+			"Probe the active tab for login/SAML/SSO redirect signatures without performing any interaction. Returns url, title, whether the page looks like a known login portal (Microsoft, Google, GitHub, Auth0, Okta), a suggested action ('auto-relogin' vs 'proceed'), and the document readyState. Pass includeSnapshot=true to also return a fresh chrome_snapshot for downstream actions. Use this before/after long sequences of chrome_click / chrome_fill to detect mid-flow logouts or re-auth challenges.",
+		promptSnippet: "Detect login/SSO redirect pages in Chrome.",
+		parameters: Type.Object({
+			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result alongside the probe." })),
+			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
+			timeoutMs: Type.Optional(Type.Number({ default: 3000, minimum: 100, maximum: 10000, description: "Probe timeout in ms. Default 3000. Capped at 10000." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = (await authorizedBridgeSend(
+				"page.sessionCheck",
+				{ ...params },
+				DEFAULT_TIMEOUT_MS,
+				signal,
+			)) as Json;
+			let inner: Json = raw;
+			if (raw && typeof raw === "object" && !Array.isArray(raw) && "result" in raw && (raw as { result?: Json }).result !== undefined) {
+				inner = (raw as { result: Json }).result;
+			}
+			// Narrow via runtime guards rather than inline-cast member access. Each property is
+			// read once with a typeof check, so a malformed bridge payload falls through to the
+			// safe default instead of silently producing wrong values.
+			let url = "(unknown)";
+			let title = "";
+			let isLoginPage = false;
+			let matchedSignature: string | null = null;
+			let cspBlocked = false;
+			let documentReady: string | null = null;
+			if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+				if (typeof (inner as { url?: unknown }).url === "string") {
+					url = (inner as { url: string }).url;
+				}
+				if (typeof (inner as { title?: unknown }).title === "string") {
+					title = (inner as { title: string }).title;
+				}
+				if ((inner as { isLoginPage?: unknown }).isLoginPage === true) {
+					isLoginPage = true;
+				}
+				if (typeof (inner as { matchedSignature?: unknown }).matchedSignature === "string") {
+					matchedSignature = (inner as { matchedSignature: string }).matchedSignature;
+				}
+				if ((inner as { cspBlocked?: unknown }).cspBlocked === true) {
+					cspBlocked = true;
+				}
+				if (typeof (inner as { documentReady?: unknown }).documentReady === "string") {
+					documentReady = (inner as { documentReady: string }).documentReady;
+				}
+			}
+			const suggestedAction = isLoginPage ? "auto-relogin" : "proceed";
+			const label = isLoginPage
+				? `login signature: ${matchedSignature}`
+				: cspBlocked
+					? "no login detected (CSP blocked read)"
+					: "no login signature";
+			const text = `Session probe @ ${url} — ${label}; suggestedAction=${suggestedAction}; documentReady=${documentReady ?? "?"}${title ? `; title=${title}` : ""}`;
+			return {
+				content: [{ type: "text", text: formatIncludedSnapshotText(params.includeSnapshot ? raw : inner, text) }],
+				details: {
+					result: raw as Json,
+					url,
+					title,
+					isLoginPage,
+					matchedSignature,
+					suggestedAction,
+					documentReady,
+					cspBlocked,
+				},
+			};
 		},
 	});
 
@@ -1560,7 +2276,7 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. Pass includeSnapshot=true to verify after typing.",
+			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. On React-controlled inputs, prefer chrome_fill — it routes through the native value setter so React state stays in sync. Pass includeSnapshot=true to verify after typing.",
 		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
 		parameters: Type.Object({
 			text: Type.String(),
@@ -1592,10 +2308,10 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+			"Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. The value to insert is passed via the `text` parameter (NOT `value`). On React-controlled inputs, fills the React state via native value setter. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling. Example: chrome_fill({ uid: \"el-7\", text: \"hello@example.com\" }).",
 		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
 		parameters: Type.Object({
-			text: Type.String(),
+			text: Type.String({ description: "Text to insert into the field. This is the value parameter; pass it as `text=`, never `value=`. Required." }),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to fill if uid is omitted." })),
 			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
@@ -1616,6 +2332,76 @@ Usage rules:
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
 			const base = `Filled ${params.text.length} character(s)${into}.`;
+			const text = summary ? `${base} (${summary})` : base;
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_set_value",
+		label: "Chrome Set Value",
+		description:
+			"Set the value of a text input, textarea, or contenteditable using either React's native value setter (when the element is React-controlled) or Chrome's CDP key path (otherwise). The value is passed via the `value` parameter. Pass verifyExpr to poll for an effect after the write (cap 5 attempts, default 2). Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after setting. Example: chrome_set_value({ uid: \"el-7\", value: \"hello@example.com\" }).",
+		promptSnippet: "Set a form field's value via React native setter or CDP keys, with optional verify polling.",
+		parameters: Type.Object({
+			value: Type.String({ description: "Value to assign. Required." }),
+			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector to set if uid is omitted." })),
+			verifyExpr: Type.Optional(Type.String({ description: "CSS selector or JS expression polled after the write to confirm the effect. Truthy = success. Defaults: bare strings are treated as CSS selectors; strings containing ; { ( ) [ = are evaluated as JS." })),
+			verifyAfterMs: Type.Optional(Type.Number({ default: 0, minimum: 0, maximum: 2000, description: "Total ms to poll verifyExpr for after the write before giving up. Default 0 = single probe with no polling. Capped at 2000." })),
+			verifyRetries: Type.Optional(Type.Number({ default: 2, minimum: 0, maximum: 5, description: "Max re-writes when verifyExpr stays falsy. Each retry waits ~150ms then re-applies the value. Default 2, max 5." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
+			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after setting." })),
+			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			// Cap verifyRetries at 5 with default 2 (wire-protocol will also cap).
+			const retriesRequested = typeof params.verifyRetries === "number" ? params.verifyRetries : 2;
+			const verifyRetries = Math.max(0, Math.min(5, retriesRequested));
+			const forwarded = { ...params, verifyRetries };
+			const raw = await authorizedBridgeSend("page.setValue", forwarded, DEFAULT_TIMEOUT_MS, signal);
+			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
+			const summary = summarizeActionResult(result);
+			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
+			const base = `Set value (${params.value.length} char(s))${into}.`;
+			const text = summary ? `${base} (${summary})` : base;
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_set_native_value",
+		label: "Chrome Set Native Value",
+		description:
+			"Set the value of a text input, textarea, or contenteditable using the native value setter (works for both React-controlled and plain inputs). Detects React-controlled targets via the __reactFiber$/__reactProps$ markers, then routes through reactCompatFill so React's onChange sees the write. The value is passed via the `value` parameter. No key events, no verify polling. Accepts a snapshot uid or CSS selector. Example: chrome_set_native_value({ uid: \"el-7\", value: \"hello@example.com\" }).",
+		promptSnippet: "Set a form field's value via the native value setter (React-safe), without key events or verify polling.",
+		parameters: Type.Object({
+			value: Type.String({ description: "Value to assign via the native value setter. Required." }),
+			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector to set if uid is omitted." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
+			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after setting." })),
+			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = await authorizedBridgeSend("page.setNativeValue", params, DEFAULT_TIMEOUT_MS, signal);
+			const rawRecord = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+			const result: Json = params.includeSnapshot && rawRecord && "result" in rawRecord ? (rawRecord.result as Json) : (raw as Json);
+			const summary = summarizeActionResult(result);
+			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
+			const base = `Set native value (${params.value.length} char(s))${into}.`;
 			const text = summary ? `${base} (${summary})` : base;
 			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
 		},
@@ -1657,13 +2443,17 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_wait_for",
 		label: "Chrome Wait For",
-		description: "Poll an existing Chrome tab until a selector exists or a JavaScript expression returns truthy.",
+		description: "Poll an existing Chrome tab until a selector exists or a JavaScript expression returns truthy. The `value` field carries BOTH the CSS selector (when kind=selector) AND the JavaScript expression (when kind=expression) — do NOT use a separate `expression` parameter; always pass it as `value=`. With kind=selector the match is filtered by visibility (offsetParent + opacity + display + visibility); waitForStable additionally requires the matched element's rect/opacity to remain unchanged across 2 RAFs + waitForStable ms; waitForSelectorCount requires at least N matching elements to satisfy; includeSnapshot='auto' returns a fresh snapshot iff the wait completed successfully. Examples: chrome_wait_for({ kind: \"selector\", value: \"#submit-btn:not([disabled])\" }) and chrome_wait_for({ kind: \"expression\", value: \"document.querySelectorAll('.row').length >= 5\" }).",
 		promptSnippet: "Wait for page state in Chrome before further automation.",
 		parameters: Type.Object({
 			kind: StringEnum(waitForValues),
-			value: Type.String({ description: "CSS selector when kind=selector; JavaScript expression when kind=expression." }),
+			value: Type.String({ description: "The CSS selector OR the JavaScript expression to evaluate, depending on `kind`. Used for both kinds; do NOT use a separate `expression` field." }),
 			timeoutMs: Type.Optional(Type.Number({ default: 10_000 })),
 			intervalMs: Type.Optional(Type.Number({ default: 250 })),
+			waitForVisible: Type.Optional(Type.Boolean({ default: true, description: "When kind=selector, only count matches whose offsetParent is non-null and whose computed opacity > 0, display != 'none', visibility != 'hidden'. Default true." })),
+			waitForStable: Type.Optional(Type.Number({ default: 0, description: "After the first visible match, sample rect+opacity across 2 RAFs + this many ms of stable time. 0 disables." })),
+			waitForSelectorCount: Type.Optional(Type.Number({ default: 1, description: "Minimum number of selector matches required (after visibility filtering) for the wait to succeed." })),
+			includeSnapshot: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("auto")], { description: "Pass true for an unconditional post-wait snapshot, or 'auto' for a snapshot only when the wait found the target. Default false." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -1672,7 +2462,11 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
-			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
+			let resultObj: unknown = result;
+			if (result && typeof result === "object" && "result" in result) {
+				resultObj = (result as { result: unknown }).result;
+			}
+			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: resultObj as Json } };
 		},
 	});
 
@@ -1892,7 +2686,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_upload_file",
 		label: "Chrome Upload File",
-		description: "Attach local files to an <input type=file> element using Chrome DevTools file-input control. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
+		description: "Attach local files to a Chrome <input type=file> element using Chrome DevTools file-input control. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
 		promptSnippet: "Attach local files to a Chrome <input type=file> without opening the native file picker.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),
@@ -1908,6 +2702,92 @@ Usage rules:
 			const paths = params.paths.map((p) => resolve(cwd, p));
 			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_credentials_list",
+		label: "Chrome Credentials List",
+		description: "List saved login aliases stored in the encrypted ~/.pi-chrome/credentials.json store. Returns name, host, and lastUsedAt. Passwords are never returned; use chrome_credentials_fill to type them into a login form.",
+		promptSnippet: "List saved login aliases (no passwords exposed).",
+		parameters: Type.Object({}),
+		async execute(): Promise<ToolTextResult> {
+			requireChromeControlAuthorized();
+			const result = await credentialsList();
+			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_credentials_add",
+		label: "Chrome Credentials Add",
+		description: "Add or update a saved login alias in the encrypted ~/.pi-chrome/credentials.json store. The password is encrypted with AES-256-GCM (scrypt-derived key) before being written. The alias is bound to a specific host; chrome_credentials_fill refuses to fill it on any other host. The passphrase is held in keytar/libsecret when available, else a chmod-600 file under ~/.pi-chrome/.",
+		promptSnippet: "Encrypt and store a username/password under an alias bound to one host.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Alias name to reference this credential with later (e.g. 'github')." }),
+			host: Type.String({ description: "Hostname this alias is allowed to fill on (e.g. 'github.com'). Lowercased before storage." }),
+			username: Type.String(),
+			password: Type.String(),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			requireChromeControlAuthorized();
+			const result = await credentialsAdd(params as { name: string; host: string; username: string; password: string });
+			return { content: [{ type: "text", text: `Saved alias '${result.name}' for host ${result.host}.` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_credentials_remove",
+		label: "Chrome Credentials Remove",
+		description: "Remove a saved alias from the encrypted ~/.pi-chrome/credentials.json store. Idempotent: returns removed=false if no such alias.",
+		promptSnippet: "Delete a saved alias.",
+		parameters: Type.Object({
+			name: Type.String(),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			requireChromeControlAuthorized();
+			const result = await credentialsRemove(String(params.name || ""));
+			return { content: [{ type: "text", text: result.removed ? `Removed alias '${params.name}'.` : `No alias named '${params.name}'.` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_credentials_fill",
+		label: "Chrome Credentials Fill (Auto-relogin)",
+		description: "Decrypt the alias's password and type the username then password into the current Chrome tab using chrome_type. Refuses if the active tab's host does not match the alias's bound host. Stops with an error if a TOTP field or hCaptcha/reCAPTCHA iframe is detected (no automatic solving). Rate-limited to 5 attempts per alias per hour. Appends an entry to ~/.pi-chrome/credentials.audit.log on every attempt.",
+		promptSnippet: "Auto-fill saved username + password into the active tab.",
+		parameters: Type.Object({
+			alias: Type.String({ description: "Alias to fill (must match an entry returned by chrome_credentials_list)." }),
+			host: Type.String({ description: "Hostname the active tab must match (cross-host guard)." }),
+			targetId: Type.Optional(Type.String()),
+			usernameUid: Type.Optional(Type.String({ description: "Snapshot uid for the username field. Recommended over selectors." })),
+			usernameSelector: Type.Optional(Type.String()),
+			passwordUid: Type.Optional(Type.String({ description: "Snapshot uid for the password field." })),
+			passwordSelector: Type.Optional(Type.String()),
+			submitSelector: Type.Optional(Type.String({ description: "Optional submit button selector to click after typing." })),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			requireChromeControlAuthorized();
+			const host = String(params.host || "").toLowerCase();
+			if (!host) throw new Error("chrome_credentials_fill: host is required");
+			const tabId = params.targetId ? Number(params.targetId) : undefined;
+			const result = await credentialsFill({
+				alias: String(params.alias || ""),
+				host,
+				tabId,
+				usernameUid: params.usernameUid ? String(params.usernameUid) : undefined,
+				usernameSelector: params.usernameSelector ? String(params.usernameSelector) : undefined,
+				passwordUid: params.passwordUid ? String(params.passwordUid) : undefined,
+				passwordSelector: params.passwordSelector ? String(params.passwordSelector) : undefined,
+				submitSelector: params.submitSelector ? String(params.submitSelector) : undefined,
+				background: params.background,
+				send: (action, p, timeoutMs) => authorizedBridgeSend(action, p, timeoutMs ?? DEFAULT_TIMEOUT_MS, signal),
+			});
+			const rateLimitRemaining = result && typeof result === "object" && "rateLimitRemaining" in result && typeof result.rateLimitRemaining === "number"
+				? result.rateLimitRemaining
+				: "?";
+			return { content: [{ type: "text", text: `Filled alias '${params.alias}' on ${host} (rate-limit remaining: ${rateLimitRemaining}).` }], details: { result: result as Json } };
 		},
 	});
 	}

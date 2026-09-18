@@ -37,22 +37,34 @@ function updateBadge() {
     /* chrome.action can be missing in the unit-test sandbox; ignore */
   }
 }
-// Active bridge probe: GET ${BRIDGE_URL}/status with a tight timeout. The popup exposes the
-// result so the user can confirm whether omp is reachable on the configured URL even when the
-// long-poll connection path looks fine. Cached briefly to avoid hammering the bridge.
+// Active bridge probe: GET ${BRIDGE_URL}/health first with a tight 750ms budget, falling back
+// to /status on an Unknown route so older pi-chrome versions (which do not yet serve /health)
+// still work. /health returns the same shape as /status with cache-control:no-store so the
+// popup and watchdog see a live bridge even when the long-poll path is idle.
 let lastBridgeProbeAt = 0;
 let lastBridgeProbe = null; // { ok, status, latencyMs, mode, error, url }
 async function probeBridge() {
   const now = Date.now();
   if (lastBridgeProbe && now - lastBridgeProbeAt < 1500) return lastBridgeProbe;
   lastBridgeProbeAt = now;
-  const url = `${BRIDGE_URL}/status`;
+  const url = `${BRIDGE_URL}/health`;
   const t0 = Date.now();
   const ctrl = (typeof AbortController === "function") ? new AbortController() : null;
   const timer = setTimeout(() => { try { ctrl?.abort(); } catch {} }, 1500);
   let probe = { ok: false, status: 0, latencyMs: 0, mode: "?", error: "", url };
   try {
-    const res = await fetch(url, { cache: "no-store", signal: ctrl?.signal });
+    let res = await fetch(url, { cache: "no-store", signal: ctrl?.signal });
+    if (res.status === 404) {
+      // Older pi-chrome (<=0.17.x without /health). Retry /status with a short fresh budget so
+      // the probe still completes inside the 1500ms outer cap.
+      const retryCtrl = (typeof AbortController === "function") ? new AbortController() : null;
+      const retryTimer = setTimeout(() => { try { retryCtrl?.abort(); } catch {} }, 750);
+      try {
+        res = await fetch(`${BRIDGE_URL}/status`, { cache: "no-store", signal: retryCtrl?.signal });
+      } finally {
+        clearTimeout(retryTimer);
+      }
+    }
     const latencyMs = Date.now() - t0;
     let body = null;
     try { body = await res.json(); } catch {}
@@ -208,6 +220,158 @@ if (chrome.runtime && chrome.runtime.onMessage) {
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
+
+// Auto-reconnect backoff for chrome.debugger sessions that detach unexpectedly
+// (Chrome nav, devtools opened/closed, target closed mid-command, etc.). Per-tab
+// schedule that grows with each consecutive failure and caps so we never race the
+// bridge ping. Stale target cleanup always runs BEFORE the timer is scheduled,
+// and the worker uses chrome.alarms as a wakeup so MV3 suspension does not eat
+// the timer.
+const RECONNECT_ALARM_NAME = "piChromeReconnect";
+const RECONNECT_SCHEDULE_MS = [250, 500, 1000, 2000, 5000, 10000, 30000];
+const RECONNECT_JITTER = 0.25; // ±25%
+const RECONNECT_BACKOFF_CAP_MS = POLL_ERROR_BACKOFF_MS * 5; // 10s — never race bridge ping
+// Map<tabId, { count: int, nextDelayMs: int, scheduledAt: number }>
+// scheduledAt is the wall-clock time at which the next reconnect attempt may run.
+// count is the number of consecutive failures (resets on success).
+const reconnectAttempts = new Map();
+let reconnectAlarmScheduled = false;
+
+// Pick the next backoff delay for `count` (0-indexed: count=0 → first attempt).
+// Always within ±25% jitter and capped at RECONNECT_BACKOFF_CAP_MS so a hot
+// auto-reconnect loop never starves the bridge ping path.
+function computeReconnectDelay(count) {
+  const idx = Math.min(Math.max(count, 0), RECONNECT_SCHEDULE_MS.length - 1);
+  const base = RECONNECT_SCHEDULE_MS[idx];
+  const cap = Math.min(base, RECONNECT_BACKOFF_CAP_MS);
+  const jitter = cap * RECONNECT_JITTER;
+  const min = Math.max(1, cap - jitter);
+  const max = cap + jitter;
+  return Math.round(min + Math.random() * (max - min));
+}
+
+// Schedule (or refresh) a chrome.alarm that wakes the worker even while
+// suspended. Two layers:
+//   - A setTimeout in the worker fires the fast path when the worker is alive
+//     and the next delay is <30s (chrome.alarms clamps delayInMinutes to
+//     0.5min minimum, which is too coarse for our 250ms-2s early steps).
+//   - A periodic chrome.alarm with periodInMinutes:1 is the MV3-safe wakeup:
+//     even if the worker suspends mid-backoff, Chrome will wake it within
+//     ~1 minute and processReconnectBackoffs() will resume from the next
+//     scheduledAt that has elapsed.
+// We always (re)create the periodic alarm whenever there is anything to do,
+// and clear it when the map empties.
+function armReconnectAlarm() {
+  if (typeof chrome === "undefined" || !chrome.alarms) return;
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const entry of reconnectAttempts.values()) {
+    if (entry.scheduledAt < earliest) earliest = entry.scheduledAt;
+  }
+  if (!Number.isFinite(earliest)) {
+    chrome.alarms.clear(RECONNECT_ALARM_NAME).catch(() => undefined);
+    reconnectAlarmScheduled = false;
+    return;
+  }
+  const delayMs = Math.max(1, earliest - Date.now());
+  // Fast path: in-worker setTimeout for sub-30s delays. Cheap, runs while the
+  // worker is awake; the periodic alarm below covers us after suspension.
+  if (delayMs < 30_000) {
+    if (!reconnectAlarmScheduled) {
+      setTimeout(() => void processReconnectBackoffs(), delayMs);
+      reconnectAlarmScheduled = true;
+    }
+  } else {
+    reconnectAlarmScheduled = true;
+  }
+  // Periodic MV3-safe wakeup: Chrome fires this every minute at most, even
+  // across worker suspension. processReconnectBackoffs() is a no-op when no
+  // scheduledAt has elapsed, so the cadence is harmless.
+  chrome.alarms.create(RECONNECT_ALARM_NAME, { periodInMinutes: 1 });
+}
+
+// Clear any reconnect bookkeeping for a tab. Called on successful attach and
+// on cancel-by-user so we do not keep retrying a session the user just killed.
+function clearReconnect(tabId) {
+  if (reconnectAttempts.delete(tabId)) {
+    if (reconnectAttempts.size === 0) {
+      reconnectAlarmScheduled = false;
+      if (typeof chrome !== "undefined" && chrome.alarms) {
+        chrome.alarms.clear(RECONNECT_ALARM_NAME).catch(() => undefined);
+      }
+    }
+  }
+}
+
+// Drain the reconnectAttempts map: for each entry whose scheduledAt has
+// elapsed, try attachDebugger. On success, clear the entry; on failure,
+// bump count and schedule the next delay. Always re-arms the alarm so
+// survivors keep trying.
+async function processReconnectBackoffs() {
+  reconnectAlarmScheduled = false;
+  if (typeof chrome !== "undefined" && chrome.alarms) {
+    chrome.alarms.clear(RECONNECT_ALARM_NAME).catch(() => undefined);
+  }
+  const now = Date.now();
+  // Snapshot keys so we can mutate the map while iterating.
+  const tabIds = Array.from(reconnectAttempts.keys());
+  for (const tabId of tabIds) {
+    const entry = reconnectAttempts.get(tabId);
+    if (!entry) continue;
+    if (entry.scheduledAt > now) continue;
+    // If the tab no longer exists or is mid-navigation, defer rather than
+    // burning an attempt. chrome.tabs.get throws for closed tabs.
+    let tabSnapshot = null;
+    try {
+      tabSnapshot = await chrome.tabs.get(tabId);
+    } catch {
+      clearReconnect(tabId);
+      continue;
+    }
+    if (!tabSnapshot || tabSnapshot.status !== "complete") {
+      // Reschedule for the same delay — try again on the next tick.
+      entry.scheduledAt = now + entry.nextDelayMs;
+      continue;
+    }
+    try {
+      await attachDebugger(tabId);
+      clearReconnect(tabId);
+    } catch (err) {
+      recordAttachEvent({ kind: "auto-reconnect-failed", tabId, message: String(err?.message || err), count: entry.count + 1 });
+      entry.count += 1;
+      entry.nextDelayMs = computeReconnectDelay(entry.count);
+      entry.scheduledAt = now + entry.nextDelayMs;
+    }
+  }
+  if (reconnectAttempts.size > 0) armReconnectAlarm();
+}
+
+// Schedule a fresh reconnect backoff for `tabId`. Caller is responsible for
+// having already cleaned up any stale CDP target on the tab (the existing
+// attachDebugger prologue does that). `reason` is recorded in the attach log.
+function scheduleReconnect(tabId, reason) {
+  const existing = reconnectAttempts.get(tabId);
+  const count = existing ? existing.count : 0;
+  const nextDelayMs = computeReconnectDelay(count);
+  reconnectAttempts.set(tabId, { count, nextDelayMs, scheduledAt: Date.now() + nextDelayMs });
+  recordAttachEvent({ kind: "auto-reconnect-scheduled", tabId, count, delayMs: nextDelayMs, reason: String(reason || "") });
+  armReconnectAlarm();
+}
+
+// Snapshot of the reconnectAttempts map suitable for inputStatus() / the
+// /chrome doctor view. Returns a plain object keyed by tabId with the same
+// shape used internally, never the live Map (so callers cannot mutate).
+function reconnectStatusSnapshot() {
+  const out = {};
+  for (const [tabId, entry] of reconnectAttempts) {
+    out[tabId] = {
+      count: entry.count,
+      nextDelayMs: entry.nextDelayMs,
+      scheduledAt: entry.scheduledAt,
+      nextDelayIn: Math.max(0, entry.scheduledAt - Date.now()),
+    };
+  }
+  return out;
+}
 
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
@@ -486,6 +650,59 @@ function withTimeout(promise, ms, label, onTimeout) {
 const attachedTabs = new Map(); // tabId -> { detachAt: number, pointer: {x,y} }
 const INPUT_IDLE_DETACH_MS = 15_000;
 const CDP_VERSION = "1.3";
+// Matches the stale-tab errors that survive the cdp() wrapper's one-shot self-heal.
+// Used by chromeInputClick to decide whether to fall through to the next link in the
+// auto-fallback chain (uid-CDP -> selector-CDP -> uid-DOM -> selector-DOM -> native).
+const STALE_CDP_PATTERN = /Debugger is not attached|Detached while|Target closed|No tab with id/i;
+function isStaleCdpError(err) { return STALE_CDP_PATTERN.test(String(err?.message || err || "")); }
+const STALE_CDP_PATTERN_FOR_CHAIN = /Debugger is not attached|Detached while|Target closed|No tab with id/i;
+
+async function chromeClickViaChain(tabId, params, baseResolved) {
+  // Chain order: uid-CDP -> selector-CDP -> uid-DOM -> selector-DOM -> native.
+  // Each link is attempted in order; on a stale-CDP error, fall through.
+  const log = [];
+  async function cdpClickOnce(resolveParams) {
+    const r = await resolveTargetInTab(tabId, resolveParams);
+    const point = r.rect ? pickInsideRect(r.rect) : { x: r.x, y: r.y };
+    await cdpMoveTo(tabId, point.x, point.y);
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
+    await sleep(rng(45, 140));
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    return { point, tag: r.tag };
+  }
+  const links = [];
+  if (params.uid) links.push({ kind: "cdp-uid", run: () => cdpClickOnce({ uid: params.uid, targetId: params.targetId }) });
+  if (params.selector) links.push({ kind: "cdp-sel", run: () => cdpClickOnce({ selector: params.selector, targetId: params.targetId }) });
+  if (params.uid) links.push({ kind: "dom-uid", run: () => domClickFallback(tabId, { uid: params.uid, targetId: params.targetId }, new Error("chain-fallback")) });
+  if (params.selector) links.push({ kind: "dom-sel", run: () => domClickFallback(tabId, { selector: params.selector, targetId: params.targetId }, new Error("chain-fallback")) });
+  // x,y-only calls: a single CDP attempt is the right path; no DOM fallback because there is
+  // no resolved element to .click(). When uid/selector are absent we still emit one direct
+  // CDP click so the chain returns success on the happy path without ever throwing
+  // "click chain exhausted" for well-formed {x,y} clicks.
+  if (links.length === 0 && Number.isFinite(Number(params.x)) && Number.isFinite(Number(params.y))) {
+    links.push({ kind: "cdp-xy", run: async () => {
+      const x = Number(params.x), y = Number(params.y);
+      await cdpMoveTo(tabId, x, y);
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
+      await sleep(rng(45, 140));
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+      return { point: { x, y }, tag: undefined };
+    } });
+  }
+  let lastErr = null;
+  for (const link of links) {
+    try {
+      const out = await link.run();
+      return { ...out, syntheticFallback: link.kind === "cdp-uid" || link.kind === "cdp-sel" || link.kind === "cdp-xy" ? "cdp-only" : "dom-click" };
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && err.message || err);
+      if (!STALE_CDP_PATTERN_FOR_CHAIN.test(msg)) throw err;
+      log.push(link.kind);
+    }
+  }
+  throw lastErr || new Error("click chain exhausted");
+}
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function rng(min, max) { return min + Math.random() * (max - min); }
@@ -494,6 +711,7 @@ function inputStatus() {
   return {
     attachedTabs: Array.from(attachedTabs.keys()),
     permissionGranted: typeof chrome !== "undefined" && !!chrome.debugger,
+    reconnectAttempts: reconnectStatusSnapshot(),
   };
 }
 
@@ -535,6 +753,31 @@ async function attachDebugger(tabId) {
     const entry = attachedTabs.get(tabId);
     entry.detachAt = Date.now() + INPUT_IDLE_DETACH_MS;
     return entry;
+  }
+  // Honor the auto-reconnect backoff: if a timer is in flight for this tab and
+  // has not yet elapsed, skip the attach and reschedule so the next user-driven
+  // call does not race the worker-initiated retry. The check is intentionally
+  // a soft gate — callers like processReconnectBackoffs() still pass through
+  // (they bypass via the direct schedule, and we let them proceed when the
+  // timer has elapsed by simply clearing the entry below).
+  const pending = reconnectAttempts.get(tabId);
+  if (pending && pending.scheduledAt > Date.now()) {
+    // Re-arm in case no other entry brought the alarm back; harmless if already set.
+    armReconnectAlarm();
+    throw new Error(`Chrome debugger attach deferred for tab ${tabId}; auto-reconnecting in ${pending.scheduledAt - Date.now()}ms`);
+  }
+  // If a tab is mid-navigation, defer until status==='complete'. chrome.debugger
+  // attach races the navigation lifecycle otherwise — Chrome will reject with
+  // "Target closed" and we'd just have to retry.
+  try {
+    const tabSnapshot = await chrome.tabs.get(tabId).catch(() => null);
+    if (tabSnapshot && tabSnapshot.status && tabSnapshot.status !== "complete") {
+      scheduleReconnect(tabId, `tab-status-${tabSnapshot.status}`);
+      throw new Error(`Chrome debugger attach deferred for tab ${tabId}; tab still ${tabSnapshot.status}`);
+    }
+  } catch (deferErr) {
+    // Only swallow if it was our own deferral; re-throw chrome.tabs errors.
+    if (deferErr && /deferred for tab/.test(String(deferErr.message || deferErr))) throw deferErr;
   }
   // Before each attach, force-detach any stale CDP target this extension owns on the tab.
   // Chrome sometimes keeps a half-dead session around (extension reload mid-attach, etc.) and
@@ -598,6 +841,9 @@ async function attachDebugger(tabId) {
   // Seed pointer in a plausible "just left the address bar" location.
   const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 }, debuggee: attachedDebuggee || { tabId } };
   attachedTabs.set(tabId, entry);
+  // Successful attach — reset the auto-reconnect backoff for this tab so the
+  // next detach starts from count=0 instead of inheriting the previous storm.
+  clearReconnect(tabId);
   return entry;
 }
 
@@ -645,7 +891,27 @@ if (chrome.debugger && chrome.debugger.onDetach) {
     if (tabId !== undefined) attachedTabs.delete(tabId);
     if (reason === "canceled_by_user") {
       console.warn(`[pi-chrome] debugger canceled by user on tab ${tabId}; Chrome input will reattach on next call`);
+      // User actively canceled — do NOT auto-reconnect. Just clear any pending
+      // backoff so we don't re-attach the moment they switch tabs.
+      clearReconnect(tabId);
+      return;
     }
+    // Stale target cleanup runs BEFORE the backoff timer is scheduled so the
+    // next attach attempt does not collide with a half-dead CDP target.
+    void (async () => {
+      try {
+        const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || [])));
+        for (const tgt of targets) {
+          if (tgt.tabId === tabId && tgt.attached) {
+            recordAttachEvent({ kind: "auto-reconnect-stale-target", tabId, target: { id: tgt.id, type: tgt.type, url: tgt.url, extensionId: tgt.extensionId } });
+            try { await chrome.debugger.detach({ tabId }); } catch {}
+            await sleep(80);
+            break;
+          }
+        }
+      } catch {}
+      scheduleReconnect(tabId, reason);
+    })();
   });
 }
 
@@ -801,7 +1067,18 @@ async function resolveTargetInTab(tabId, params) {
       if (el) {
         el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         const r = el.getBoundingClientRect();
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2, rect: { left: r.left, top: r.top, width: r.width, height: r.height }, tag: el.tagName, found: true };
+        // Sample computed style for the visibility-gate fast path in chromeInputType.
+        // The slow path falls back to snapshot_injected.js's countMatchesStable predicate.
+        const cs = getComputedStyle(el);
+        return {
+          x: r.left + r.width / 2, y: r.top + r.height / 2,
+          rect: { left: r.left, top: r.top, width: r.width, height: r.height },
+          tag: el.tagName,
+          found: true,
+          opacity: parseFloat(cs.opacity || "1"),
+          display: cs.display,
+          visibility: cs.visibility,
+        };
       }
       if (typeof x === "number" && typeof y === "number") return { x, y, rect: null, tag: null, found: true };
       return { found: false };
@@ -972,20 +1249,77 @@ async function domClickFallback(tabId, params, cause) {
   return { input: "dom-fallback", reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
 }
 
+// Detect Bootstrap / react-bootstrap tab toggles and dispatch a real synthetic click via
+  // el.click() (with a bubbling MouseEvent so react-bootstrap's bubbling handler fires).
+  // Returns { handled: true, tag } on success so the caller can skip the CDP mousePressed
+  // path; returns { handled: false } when the target is not a known toggle so the existing
+  // CDP path runs unchanged. Per ARCHITECTURE-v2.md §2 (A2).
+  async function tryBootstrapTabSynthetic(tabId, params, resolved) {
+    if (!params.selector && !params.uid) return { handled: false };
+    let info = null;
+    try {
+      const results = await executeScriptTimed({
+        target: { tabId, frameIds: [0] },
+        world: "MAIN",
+        func: (sel, uid) => {
+          const fn = window.__piChromeInspectToggleTarget;
+          if (typeof fn !== "function") return null;
+          const state = window.__PI_CHROME_STATE__;
+          let el = null;
+          if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
+          else if (sel) el = document.querySelector(sel);
+          if (!el) return null;
+          return fn(el);
+        },
+        args: [params.selector ?? null, params.uid ?? null],
+      }, `inspect toggle target in tab ${tabId}`);
+      info = results?.[0]?.result || null;
+    } catch {
+      return { handled: false };
+    }
+    if (!info || (info.kind !== "react-bootstrap-tab" && info.kind !== "bootstrap-nav-link")) return { handled: false };
+    try {
+      await executeScriptTimed({
+        target: { tabId, frameIds: [0] },
+        world: "MAIN",
+        func: (sel, uid) => {
+          const state = window.__PI_CHROME_STATE__;
+          let el = null;
+          if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
+          else if (sel) el = document.querySelector(sel);
+          if (!el) return false;
+          // Synthesize a bubbling MouseEvent + invoke click() so react-bootstrap's
+          // onClick handler (which listens via document delegation) fires.
+          const evt = new MouseEvent("click", { bubbles: true, cancelable: true, view: window, button: 0 });
+          const dispatched = el.dispatchEvent(evt);
+          el.click();
+          return dispatched !== false;
+        },
+        args: [params.selector ?? null, params.uid ?? null],
+      }, `synthetic tab toggle click in tab ${tabId}`);
+      // One animation frame so the pane swap / show.bs.tab listeners settle before the
+      // caller does any follow-up snapshot.
+      await sleep(16);
+      const tag = resolved && resolved.tag ? resolved.tag : undefined;
+      return { handled: true, tag };
+    } catch {
+      return { handled: false };
+    }
+  }
+
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   try {
     await attachDebugger(tab.id);
     const resolved = await resolveTargetInTab(tab.id, params);
-    const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
-    await cdpMoveTo(tab.id, point.x, point.y);
-    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
-    await sleep(rng(45, 140));
-    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
-    // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
-    // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
-    // Reset focus styling after pointer click when possible.
+    const synthetic = await tryBootstrapTabSynthetic(tab.id, params, resolved);
+    if (synthetic && synthetic.handled) {
+      return runClickVerify(tab.id, params, { input: "synthetic-tab", x: resolved.x, y: resolved.y, tag: synthetic.tag || resolved.tag, syntheticFallback: "react-prog" });
+    }
+    // Auto-fallback chain (item 3): uid-CDP -> selector-CDP -> uid-DOM -> selector-DOM -> native.
+    const chained = await chromeClickViaChain(tab.id, params, resolved);
+    // Reset :focus-visible (existing behavior preserved)
     if (params.selector || params.uid) {
       await executeScriptTimed({
         target: { tabId: tab.id, frameIds: [0] },
@@ -1002,10 +1336,213 @@ async function chromeInputClick(params) {
         args: [params.selector ?? null, params.uid ?? null],
       }, `reset focus style in tab ${tab.id}`).catch(() => undefined);
     }
-    return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
+    return runClickVerify(tab.id, params, { input: chained.syntheticFallback === "dom-click" ? "dom-fallback" : "chrome", x: chained.point?.x, y: chained.point?.y, tag: chained.tag, syntheticFallback: chained.syntheticFallback });
   } catch (error) {
     if (params.domFallback === false) throw error;
-    return domClickFallback(tab.id, params, error);
+    const fallback = await domClickFallback(tab.id, params, error);
+    return { ...fallback, syntheticFallback: "dom-click" };
+  }
+}
+
+// Stale-CDP retry wrapper: re-fires chromeInputClick up to `retries` times when the bridge
+// throws a stale-tab error (Debugger is not attached / Detached while / Target closed /
+// No tab with id). Useful right after a tab activate / navigate where the active target may
+// briefly report a stale handle. Backoff grows with `backoff` strategy ("linear" or
+// "exponential"); per-attempt delay is capped at 5000ms. Non-stale errors short-circuit
+// immediately so real failures aren't masked.
+async function chromeInputClickRetry(params) {
+  const retriesRaw = Number(params.retries);
+  const retries = Number.isFinite(retriesRaw) ? Math.min(Math.max(0, Math.floor(retriesRaw)), 5) : 0;
+  const delayRaw = Number(params.delayMs);
+  const baseDelay = Number.isFinite(delayRaw) ? Math.min(Math.max(0, Math.floor(delayRaw)), 5000) : 250;
+  const backoff = params.backoff === "exponential" ? "exponential" : "linear";
+  const started = Date.now();
+  let attempts = 0;
+  let lastSyntheticFallback;
+  let lastError;
+  let lastResult;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    attempts = attempt + 1;
+    if (attempt > 0) {
+      const growth = backoff === "exponential" ? Math.pow(2, attempt - 1) : 1;
+      const wait = Math.min(baseDelay * growth, 5000);
+      if (wait > 0) await sleep(wait);
+    }
+    try {
+      const result = await chromeInputClick(params);
+      lastSyntheticFallback = result && typeof result === "object" ? result.syntheticFallback : undefined;
+      lastResult = result;
+      lastError = undefined;
+      const totalMs = Date.now() - started;
+      return { ...result, attempts, lastSyntheticFallback, lastError: undefined, totalMs };
+    } catch (error) {
+      lastError = String(error && error.message ? error.message : error);
+      if (!isStaleCdpError(error) || attempt >= retries) {
+        const totalMs = Date.now() - started;
+        const err = new Error(lastError);
+        err.attempts = attempts;
+        err.lastError = lastError;
+        err.totalMs = totalMs;
+        err.lastSyntheticFallback = lastSyntheticFallback;
+        throw err;
+      }
+    }
+  }
+  // Unreachable (loop returns or throws on final attempt), but keep linter happy.
+  const totalMs = Date.now() - started;
+  return { ...(lastResult || {}), attempts, lastSyntheticFallback, lastError, totalMs };
+}
+
+// page.sessionCheck: cheap read-only probe to detect login/SAML/SSO redirect pages without
+// clicking anything. Returns url/title/innerText-readiness and a matched signature label from
+// a 5-entry table (Microsoft / Google / GitHub / Auth0 / Okta). When Runtime.evaluate throws
+// a CSP block, surface cspBlocked=true with documentReady=null so callers can decide whether
+// to assume-proceed or surface a warning.
+const SESSION_SIGNATURES = [
+  { label: "Microsoft SSO", pattern: /login\.microsoftonline\.com|login\.live\.com/i },
+  { label: "Google SSO", pattern: /accounts\.google\.com/i },
+  { label: "GitHub Login", pattern: /github\.com\/login/i },
+  { label: "Auth0", pattern: /\.auth0\.com/i },
+  { label: "Okta", pattern: /\.okta\.com|\.oktacdn\.com/i },
+];
+
+async function probeSessionInTab(params) {
+  const tab = await getTabByParams(params);
+  await bringToFront(tab, params);
+  let url = "";
+  let title = "";
+  let documentReady = null;
+  let firstInnerText = "";
+  let cspBlocked = false;
+  let blockedError = "";
+  try {
+    const results = await executeScriptTimed({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: () => {
+        try {
+          const body = document.body || document.documentElement;
+          const text = body && typeof body.innerText === "string" ? body.innerText : "";
+          return {
+            url: location.href || "",
+            title: document.title || "",
+            documentReady: document.readyState || null,
+            firstInnerText: text.slice(0, 200),
+          };
+        } catch (innerErr) {
+          return { error: String(innerErr && innerErr.message ? innerErr.message : innerErr) };
+        }
+      },
+    }, `probeSession tab ${tab.id}`);
+    const first = results && Array.isArray(results) ? results[0] : null;
+    const value = first && typeof first === "object" ? first.result : null;
+    if (value && typeof value === "object" && !Array.isArray(value) && "error" in value) {
+      cspBlocked = true;
+      blockedError = typeof value.error === "string" ? value.error : "unknown";
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      url = typeof value.url === "string" ? value.url : "";
+      title = typeof value.title === "string" ? value.title : "";
+      documentReady = typeof value.documentReady === "string" ? value.documentReady : null;
+      firstInnerText = typeof value.firstInnerText === "string" ? value.firstInnerText : "";
+    }
+  } catch (error) {
+    cspBlocked = true;
+    blockedError = String(error && error.message ? error.message : error);
+  }
+  let matched = null;
+  for (const entry of SESSION_SIGNATURES) {
+    if (entry.pattern.test(url) || entry.pattern.test(title) || entry.pattern.test(firstInnerText)) {
+      matched = entry;
+      break;
+    }
+  }
+  return {
+    url,
+    title,
+    firstInnerText,
+    documentReady,
+    isLoginPage: matched !== null,
+    matchedSignature: matched ? matched.label : null,
+    suggestedAction: matched ? "auto-relogin" : "proceed",
+    cspBlocked,
+    blockedError: cspBlocked ? blockedError : undefined,
+  };
+}
+
+// Save-Bubble retry: when an onClick handler defers its effect (e.g. async show of a
+// confirmation bubble), the first CDP click often lands before the effect is observable.
+// Run a probe (`verifyExpr`) ~150ms after the click and, if still falsy, retry the click
+// up to `verifyRetries` times. Polling stays within `verifyAfterMs` total — beyond that we
+// trust whatever the page has settled on and return success.
+async function runClickVerify(tabId, params, baseResult) {
+  const expr = typeof params.verifyExpr === "string" ? params.verifyExpr.trim() : "";
+  if (!expr) return baseResult;
+  const afterMs = Math.min(Math.max(0, Number(params.verifyAfterMs) || 0), 2000);
+  const retriesRaw = Number(params.verifyRetries);
+  const retries = Number.isFinite(retriesRaw) ? Math.min(Math.max(0, Math.floor(retriesRaw)), 3) : 1;
+  let attempt = 0;
+  let lastProbe = false;
+  let verified = false;
+  while (true) {
+    const jitter = 120 + Math.floor(Math.random() * 60); // ~120-180ms
+    await sleep(jitter);
+    if (afterMs > 0) {
+      const probeStart = Date.now();
+      while (Date.now() - probeStart < afterMs) {
+        const r = await runVerifyProbe(tabId, expr);
+        if (r.ok) { verified = true; lastProbe = true; break; }
+        await sleep(50);
+      }
+      if (verified) break;
+      lastProbe = false;
+    } else {
+      const r = await runVerifyProbe(tabId, expr);
+      lastProbe = r.ok;
+      if (r.ok) { verified = true; break; }
+    }
+    attempt += 1;
+    if (attempt > retries) break;
+    // Re-run the click synthetically via a follow-up CDP mousePressed/Released at the same
+    // point so we don't re-resolve a stale selector. Skipped for the synthetic-tab branch
+    // because that already invoked the bootstrap-tab handler — re-invoking it would re-show
+    // or re-toggle state the user didn't ask for.
+    if (baseResult.input !== "synthetic-tab" && typeof baseResult.x === "number" && typeof baseResult.y === "number") {
+      await sleep(150);
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: baseResult.x, y: baseResult.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
+      await sleep(rng(45, 140));
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: baseResult.x, y: baseResult.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    }
+  }
+  return { ...baseResult, verifyExpr: expr, verified, verifyAttempts: attempt, verifyResult: lastProbe === true };
+}
+
+// Eval `expr` in the page's MAIN world. Returns { ok: boolean } — never throws, never
+// throws on syntax errors, just reports false. The expression is allowed to be either a
+// bare JS expression (`document.querySelector('.bubble')`) or a CSS selector (anything
+// without an obvious JS identifier pattern); when it looks like a selector, the helper
+// forwards it to document.querySelector so callers can write `'.save-bubble'` plainly.
+async function runVerifyProbe(tabId, expr) {
+  try {
+    const looksLikeJs = /[(){}\[\]=;]/.test(expr);
+    const results = await executeScriptTimed({
+      target: { tabId, frameIds: [0] },
+      world: "MAIN",
+      func: (expression, isJs) => {
+        try {
+          if (isJs) {
+            // eslint-disable-next-line no-new-func
+            const v = (0, eval)(expression);
+            return { ok: !!v };
+          }
+          return { ok: !!document.querySelector(expression) };
+        } catch { return { ok: false }; }
+      },
+      args: [expr, looksLikeJs],
+    }, `verify probe in tab ${tabId}`);
+    const r = results?.[0]?.result;
+    return { ok: !!(r && r.ok === true) };
+  } catch {
+    return { ok: false };
   }
 }
 
@@ -1102,6 +1639,61 @@ async function typeTextInTab(tabId, text, perCharacter) {
   return "keys";
 }
 
+// Visibility gate for chromeInputType: reuses the predicate that snapshot_injected.js uses
+// for chrome_snapshot (`countMatchesStable.__visible`) by injecting that helper script and
+// calling `__piChromeCountMatchesStable` against the resolved element. Fast path uses the
+// inline style samples returned by resolveTargetInTab; slow path schedules one rAF and
+// re-checks once via the same predicate.
+async function ensureTargetVisible(tabId, params) {
+  const isPass = (s) => s
+    && s.display !== "none"
+    && s.visibility !== "hidden"
+    && parseFloat(s.opacity || "1") > 0;
+  // --- Fast path: rely on the style samples returned by resolveTargetInTab ---
+  if (isPass(params && params.__style)) return { visible: true, fastPath: true };
+  // --- Slow path: re-sample with a single rAF, then re-check via the snapshot predicate ---
+  const awaitRaf = () => new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 16);
+  });
+  await awaitRaf();
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    files: ["snapshot_injected.js"],
+    func: (uid, selector) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if ((!el || !el.isConnected) && selector) el = document.querySelector(selector);
+      if (!el) return { visible: false, staleUid: !!uid, reason: "element not found" };
+      // Reuse the snapshot predicate by tagging the element with a unique attribute and
+      // running __piChromeCountMatchesStable — its inline `visible` filter is the same
+      // predicate used by chrome_snapshot, so we avoid inlining the logic here.
+      const token = "__piChromeVisGate_" + Math.random().toString(36).slice(2, 10);
+      el.setAttribute("data-" + token, "1");
+      const sel = "[data-" + token + "=\"1\"]";
+      const sample = window.__piChromeCountMatchesStable(sel, null, 0);
+      el.removeAttribute("data-" + token);
+      const style = getComputedStyle(el);
+      return {
+        visible: !!(sample && sample.count === 1),
+        opacity: parseFloat(style.opacity || "1"),
+        display: style.display,
+        visibility: style.visibility,
+      };
+    },
+    args: [params?.uid ?? null, params?.selector ?? null],
+  }, `visibility gate for tab ${tabId}`);
+  const v = results?.[0]?.result;
+  if (!v || !v.visible) {
+    const err = new Error("Target element is not visible (offsetParent null, display:none, visibility:hidden, or opacity 0); refresh chrome_snapshot");
+    err.staleUid = params?.uid ?? null;
+    err.reason = "invisible-target";
+    throw err;
+  }
+  return { visible: true, fastPath: false, style: { opacity: v.opacity, display: v.display, visibility: v.visibility } };
+}
+
 async function chromeInputType(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
@@ -1109,6 +1701,16 @@ async function chromeInputType(params) {
   if (params.selector || params.uid) {
     // Focus target by clicking it first.
     const resolved = await resolveTargetInTab(tab.id, params);
+    // Pre-RAF visibility gate: bail before dispatching focus-by-click if the resolved
+    // target is hidden by CSS. resolveTargetInTab returns the inline style samples
+    // required for the fast path; the slow path schedules one rAF and re-checks via
+    // the snapshot_injected.js predicate (no inline duplication).
+    params.__style = {
+      opacity: resolved.opacity,
+      display: resolved.display,
+      visibility: resolved.visibility,
+    };
+    await ensureTargetVisible(tab.id, params);
     const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
     await cdpMoveTo(tab.id, point.x, point.y);
     await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
@@ -1136,30 +1738,321 @@ async function domFillFallback(tabId, params, cause) {
       el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
       if (typeof el.focus === "function") el.focus({ preventScroll: true });
       const value = String(text ?? "");
-      if ("value" in el) {
-        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-        if (setter) setter.call(el, value);
-        else el.value = value;
-      } else if (el.isContentEditable) {
-        el.textContent = value;
-      } else {
+      if (!("value" in el) && !el.isContentEditable) {
         throw new Error(`DOM fallback target is not fillable: <${el.tagName.toLowerCase()}>`);
       }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      const compat = (() => {
+        let isReact = false;
+        for (const k of Object.keys(el)) {
+          if (k.startsWith("__reactFiber$") || k.startsWith("__reactProps$") || k.startsWith("__reactInternalInstance$")) {
+            isReact = true;
+            break;
+          }
+        }
+        if ("value" in el) {
+          const prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+          if (descriptor?.set) descriptor.set.call(el, value);
+          else el.value = value;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { usedReact: isReact, valueMatches: el.value === value };
+        } else if (el.isContentEditable) {
+          el.textContent = value;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+          return { usedReact: isReact, valueMatches: el.textContent === value };
+        }
+        return { usedReact: false, valueMatches: false };
+      })();
       if (submit) {
         const form = el.closest("form");
         if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
         else document.querySelector("button,[type=submit]")?.click();
       }
-      return { valueMatches: "value" in el ? el.value === value : el.textContent === value, tag: el.tagName, url: location.href };
+      return { valueMatches: compat.valueMatches, tag: el.tagName, url: location.href, usedReact: compat.usedReact };
     },
     args: [params.selector ?? null, params.uid ?? null, params.text ?? "", params.submit === true],
   }, `DOM fill fallback in tab ${tabId}`);
   const v = results?.[0]?.result;
   if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
-  return { input: "dom-fallback", length: String(params.text || "").length, valueMatches: v?.valueMatches, reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+  return { input: "dom-fallback", length: String(params.text || "").length, valueMatches: v?.valueMatches, usedReact: v?.usedReact === true, reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+}
+
+// page.setNativeValue: write the value via the React-aware path (detectReactControlled + reactCompatFill)
+// only — no CDP key path, no focus/click preamble, no verify polling. Always uses the native value setter
+// (works for both React-controlled and plain inputs/textareas/contenteditables) followed by input + change
+// events in the shape React's synthetic event system listens for. Returns { ok, usedReact, valueMatches, tag }.
+async function chromeInputSetNativeValue(params) {
+  const tab = await getTabByParams(params);
+  await bringToFront(tab, params);
+  if (!(params.selector || params.uid)) throw new Error("chrome.setNativeValue: selector or uid required");
+  if (params.value === undefined || params.value === null) throw new Error("chrome.setNativeValue: value required");
+  try {
+    // Inline reactCompatFill: native value setter + input/change events. This always runs
+    // through the React-safe path so the same call works for plain inputs and React-controlled ones.
+    const fill = await executeScriptTimed({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: (selector, uid, val) => {
+        const state = window.__PI_CHROME_STATE__;
+        let el = uid && state && state.elements ? state.elements[uid] : null;
+        if (uid && (!el || !el.isConnected)) return { staleUid: true };
+        if (!el && selector) el = document.querySelector(selector);
+        if (!el) return { notFound: true };
+        if (typeof el.focus === "function") el.focus({ preventScroll: true });
+        // Inline detectReactControlled — page-world func cannot see service_worker helpers.
+        let isReact = false;
+        for (const k of Object.keys(el)) {
+          if (k.startsWith("__reactFiber$") || k.startsWith("__reactProps$") || k.startsWith("__reactInternalInstance$")) {
+            isReact = true;
+            break;
+          }
+        }
+        // Inline reactCompatFill: native value setter + input/change events for React.
+        if ("value" in el) {
+          const prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+          if (descriptor?.set) descriptor.set.call(el, val);
+          else el.value = val;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        } else if (el.isContentEditable) {
+          el.textContent = val;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+        }
+        const valueMatches = "value" in el ? el.value === val : el.textContent === val;
+        return { usedReact: isReact, valueMatches, tag: el.tagName };
+      },
+      args: [params.selector ?? null, params.uid ?? null, String(params.value)],
+    }, `setNativeValue react-compat fill in tab ${tab.id}`);
+    const fr = fill?.[0]?.result || {};
+    if (fr.staleUid) throw new Error("snapshot uid is stale; refresh chrome_snapshot");
+    if (fr.notFound) throw new Error(`chrome.setNativeValue target not found: ${params.uid || params.selector}`);
+    return { ok: true, usedReact: fr.usedReact === true, valueMatches: fr.valueMatches === true, tag: fr.tag };
+  } catch (error) {
+    if (params.domFallback === false) throw error;
+    // Fallback path: mirror domFillFallback's plain-value branch (still via native setter, no key events).
+    const fallback = await executeScriptTimed({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: (selector, uid, val) => {
+        const state = window.__PI_CHROME_STATE__;
+        let el = uid && state && state.elements ? state.elements[uid] : null;
+        if (uid && (!el || !el.isConnected)) return { staleUid: true };
+        if (!el && selector) el = document.querySelector(selector);
+        if (!el) throw new Error(`setNativeValue fallback target not found: ${uid || selector}`);
+        if (typeof el.focus === "function") el.focus({ preventScroll: true });
+        if ("value" in el) {
+          el.value = val;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        } else if (el.isContentEditable) {
+          el.textContent = val;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+        }
+        return { usedReact: false, valueMatches: "value" in el ? el.value === val : el.textContent === val, tag: el.tagName };
+      },
+      args: [params.selector ?? null, params.uid ?? null, String(params.value)],
+    }, `setNativeValue DOM fallback in tab ${tab.id}`);
+    const fb = fallback?.[0]?.result || {};
+    return { ok: true, usedReact: fb.usedReact === true, valueMatches: fb.valueMatches === true, tag: fb.tag, syntheticFallback: "dom-fallback" };
+  }
+}
+
+// page.setValue: write the value directly via the React-aware path (detectReactControlled + reactCompatFill)
+// OR via Chrome CDP key events when the element is not React-controlled. Unlike page.fill, this skips
+// the focus/click/select-all preamble: callers are expected to have already focused the field (typically
+// by clicking it). Optional verifyExpr polling re-applies the value when the probe stays falsy.
+async function chromeInputSetValue(params) {
+  const tab = await getTabByParams(params);
+  await bringToFront(tab, params);
+  if (!(params.selector || params.uid)) throw new Error("chrome.setValue: selector or uid required");
+  if (params.value === undefined || params.value === null) throw new Error("chrome.setValue: value required");
+  const verifyRetriesRaw = typeof params.verifyRetries === "number" ? params.verifyRetries : 2;
+  const verifyRetries = Math.max(0, Math.min(5, verifyRetriesRaw));
+  const verifyAfterMs = typeof params.verifyAfterMs === "number" ? Math.max(0, Math.min(2000, params.verifyAfterMs)) : 0;
+  const verifyExpr = params.verifyExpr;
+  let attempt = 0;
+  let lastResult = null;
+  let staleUid = false;
+  while (attempt <= verifyRetries) {
+    try {
+      await attachDebugger(tab.id);
+      const resolved = await resolveTargetInTab(tab.id, params);
+      const probe = await executeScriptTimed({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "MAIN",
+        func: (selector, uid) => {
+          const state = window.__PI_CHROME_STATE__;
+          let el = uid && state && state.elements ? state.elements[uid] : null;
+          if (uid && (!el || !el.isConnected)) return { staleUid: true };
+          if (!el && selector) el = document.querySelector(selector);
+          if (!el) return { notFound: true };
+          // Inline detectReactControlled — executeScriptTimed's func runs in the page world and
+          // cannot see service_worker helpers like detectReactControlled.
+          let isReact = false;
+          for (const k of Object.keys(el)) {
+            if (k.startsWith("__reactFiber$") || k.startsWith("__reactProps$") || k.startsWith("__reactInternalInstance$")) {
+              isReact = true;
+              break;
+            }
+          }
+          return { isReact, tag: el.tagName };
+        },
+        args: [params.selector ?? null, params.uid ?? null],
+      }, `setValue react probe in tab ${tab.id}`);
+      const probeResult = probe?.[0]?.result;
+      if (probeResult?.staleUid) {
+        staleUid = true;
+        throw new Error("snapshot uid is stale; refresh chrome_snapshot");
+      }
+      if (probeResult?.notFound) throw new Error(`chrome.setValue target not found: ${params.uid || params.selector}`);
+      const isReact = probeResult?.isReact === true;
+      const tag = probeResult?.tag;
+      let usedReact = false;
+      let valueMatches = false;
+      if (isReact) {
+        // Inline reactCompatFill: native value setter + input/change events for React.
+        const reactFill = await executeScriptTimed({
+          target: { tabId: tab.id, frameIds: [0] },
+          world: "MAIN",
+          func: (selector, uid, val) => {
+            const state = window.__PI_CHROME_STATE__;
+            let el = uid && state && state.elements ? state.elements[uid] : null;
+            if (!el && selector) el = document.querySelector(selector);
+            if (!el) throw new Error(`reactCompatFill target not found: ${uid || selector}`);
+            if (typeof el.focus === "function") el.focus({ preventScroll: true });
+            const prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+            if (descriptor?.set) descriptor.set.call(el, val);
+            else el.value = val;
+            el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return { usedReact: true, valueMatches: el.value === val };
+          },
+          args: [params.selector ?? null, params.uid ?? null, String(params.value)],
+        }, `setValue react-compat fill in tab ${tab.id}`);
+        const fr = reactFill?.[0]?.result || {};
+        usedReact = fr.usedReact === true;
+        valueMatches = fr.valueMatches === true;
+      } else {
+        // Non-React path: native Input.dispatchKeyEvent flow mirroring chromeInputFill's tail.
+        const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+        await cdpMoveTo(tab.id, point.x, point.y);
+        // Triple-click selects all in input fields (matches chromeInputFill preamble).
+        for (let i = 1; i <= 3; i++) {
+          await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: i, pointerType: "mouse", force: 0.5 });
+          await sleep(rng(20, 60));
+          await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
+          await sleep(rng(20, 60));
+        }
+        await contentEditableInTab(tab.id, params);
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+        await sleep(rng(20, 60));
+        await typeTextInTab(tab.id, String(params.value), false);
+        // Verify the typed value matches.
+        const verify = await executeScriptTimed({
+          target: { tabId: tab.id, frameIds: [0] },
+          world: "MAIN",
+          func: (selector, uid, val) => {
+            const state = window.__PI_CHROME_STATE__;
+            let el = uid && state && state.elements ? state.elements[uid] : null;
+            if (!el && selector) el = document.querySelector(selector);
+            if (!el) return { valueMatches: false, tag: null };
+            return { valueMatches: el.value === val || el.textContent === val, tag: el.tagName };
+          },
+          args: [params.selector ?? null, params.uid ?? null, String(params.value)],
+        }, `setValue non-react verify in tab ${tab.id}`);
+        const vr = verify?.[0]?.result || {};
+        usedReact = false;
+        valueMatches = vr.valueMatches === true;
+      }
+      lastResult = { ok: true, usedReact, valueMatches, tag, input: isReact ? "react-compat" : "chrome", attempts: attempt + 1 };
+      if (!verifyExpr || valueMatches) break;
+      // Polling: wait verifyAfterMs, then re-probe via verifyExpr.
+      if (verifyAfterMs > 0 && attempt < verifyRetries) {
+        await sleep(Math.max(60, Math.min(verifyAfterMs, 250)));
+        const probeVerify = await executeScriptTimed({
+          target: { tabId: tab.id, frameIds: [0] },
+          world: "MAIN",
+          func: (expr) => {
+            try {
+              const looksLikeSelector = expr && !/[;{([]/.test(expr);
+              if (looksLikeSelector) {
+                const els = document.querySelectorAll(expr);
+                return { ok: true, truthy: els.length > 0 };
+              }
+              // eslint-disable-next-line no-new-func
+              const fn = new Function("return (" + expr + ");");
+              return { ok: true, truthy: !!fn() };
+            } catch (e) {
+              return { ok: false, error: String(e && e.message || e) };
+            }
+          },
+          args: [verifyExpr],
+        }, `setValue verifyExpr probe in tab ${tab.id}`);
+        const pvr = probeVerify?.[0]?.result;
+        if (pvr?.truthy) break;
+      } else if (attempt < verifyRetries) {
+        await sleep(150);
+      }
+      attempt++;
+      continue;
+    } catch (error) {
+      if (staleUid) throw error;
+      if (params.domFallback === false) throw error;
+      // Only fall back on transient attach/CDP failures; React/selector errors rethrow.
+      const msg = String(error && error.message || error);
+      if (!/Debugger is not attached|Target closed|No tab with id|Cannot access a chrome-extension/i.test(msg)) throw error;
+      return withOptionalSnapshot(params, (p) => domSetValueFallback(tab.id, p, error));
+    }
+  }
+  if (!lastResult) throw new Error("chrome.setValue failed without producing a result");
+  if (verifyExpr && lastResult.valueMatches === false && attempt > verifyRetries) {
+    lastResult.verified = false;
+  }
+  return lastResult;
+}
+
+async function domSetValueFallback(tabId, params, cause) {
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid, val) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (uid && (!el || !el.isConnected)) return { staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot`, url: location.href };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el) throw new Error(`setValue fallback target not found: ${uid || selector}`);
+      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      const isReact = (() => {
+        for (const k of Object.keys(el)) {
+          if (k.startsWith("__reactFiber$") || k.startsWith("__reactProps$") || k.startsWith("__reactInternalInstance$")) return true;
+        }
+        return false;
+      })();
+      if (isReact) {
+        const prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+        if (descriptor?.set) descriptor.set.call(el, val);
+        else el.value = val;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if ("value" in el) {
+        el.value = val;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (el.isContentEditable) {
+        el.textContent = val;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+      }
+      return { ok: true, usedReact: isReact, valueMatches: ("value" in el ? el.value === val : el.textContent === val), tag: el.tagName };
+    },
+    args: [params.selector ?? null, params.uid ?? null, String(params.value ?? "")],
+  }, `setValue DOM fallback in tab ${tabId}`);
+  const r = results?.[0]?.result || {};
+  return { input: "dom-fallback", ...r };
 }
 
 async function chromeInputFill(params) {
@@ -1179,11 +2072,64 @@ async function chromeInputFill(params) {
       await sleep(rng(20, 60));
     }
     await contentEditableInTab(tab.id, params);
+    // Detect React-controlled inputs BEFORE the proto setter path: CDP key events often
+    // don't propagate to React's synthetic event system, leaving React state empty even
+    // though the DOM shows the typed text. Route those targets through reactCompatFill
+    // so React sees the native value setter + input/change events it expects.
+    const reactProbe = await executeScriptTimed({
+      target: { tabId: tab.id, frameIds: [0] },
+      world: "MAIN",
+      func: (selector, uid) => {
+        const state = window.__PI_CHROME_STATE__;
+        let el = uid && state && state.elements ? state.elements[uid] : null;
+        if (uid && (!el || !el.isConnected)) return { staleUid: true };
+        if (!el && selector) el = document.querySelector(selector);
+        if (!el) return { notFound: true };
+        // Inline React detection — executeScriptTimed's func runs in the page world and
+        // cannot see service_worker helpers like detectReactControlled.
+        let isReact = false;
+        for (const k of Object.keys(el)) {
+          if (k.startsWith("__reactFiber$") || k.startsWith("__reactProps$") || k.startsWith("__reactInternalInstance$")) {
+            isReact = true;
+            break;
+          }
+        }
+        return { isReact, tag: el.tagName };
+      },
+      args: [params.selector ?? null, params.uid ?? null],
+    }, `react probe in tab ${tab.id}`);
+    const probe = reactProbe?.[0]?.result;
+    if (probe?.staleUid) throw new Error("snapshot uid is stale; refresh chrome_snapshot");
+    const text = String(params.text || "");
+    if (probe?.isReact) {
+      const fillResult = await executeScriptTimed({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "MAIN",
+        func: (selector, uid, val) => {
+          const state = window.__PI_CHROME_STATE__;
+          let el = uid && state && state.elements ? state.elements[uid] : null;
+          if (!el && selector) el = document.querySelector(selector);
+          if (!el) throw new Error(`reactCompatFill target not found: ${uid || selector}`);
+          if (typeof el.focus === "function") el.focus({ preventScroll: true });
+          // Inline reactCompatFill: native value setter + input/change events for React.
+          const prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+          if (descriptor?.set) descriptor.set.call(el, val);
+          else el.value = val;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { usedReact: true, valueMatches: el.value === val };
+        },
+        args: [params.selector ?? null, params.uid ?? null, text],
+      }, `react-compat fill in tab ${tab.id}`);
+      if (params.submit) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
+      const fr = fillResult?.[0]?.result || {};
+      return { input: "react-compat", length: text.length, usedReact: fr.usedReact === true, valueMatches: fr.valueMatches === true, tag: probe.tag };
+    }
     // Delete selection.
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
     await sleep(rng(20, 60));
-    const text = String(params.text || "");
     const typing = await typeTextInTab(tab.id, text, params.perCharacter);
     if (params.submit) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
     return { input: "chrome", length: text.length, typing };
@@ -1341,6 +2287,7 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "pi-bridge-keepalive") void pollLoop();
+  else if (alarm.name === RECONNECT_ALARM_NAME) void processReconnectBackoffs();
 });
 
 // Note: chrome.action.onClicked is intentionally NOT registered. The toolbar action opens the
@@ -1517,6 +2464,97 @@ async function groupTab(tab, title, color) {
   return { tab: await formatTab(grouped), group: await groupRecord(groupId) };
 }
 
+// =================== credentials.fill (worker) ===================
+// Type one field of a saved credential into the active tab. The Node side calls this twice
+// per fill: once with step=username, then once with step=password. Each call:
+//   1. Resolves the target tab by explicit targetId or urlIncludes. credentials.fill MUST
+//      NEVER fall back to creating a fresh automation target — we need a real URL to read
+//      for the cross-host guard.
+//   2. Re-checks (tab URL hostname) === params.host. The Node side already checked before
+//      sending; the worker defends against tabs that navigated mid-flight.
+//   3. Re-checks for MFA / CAPTCHA on the first step (username). The Node side already
+//      probed, but the worker re-probes so the second wire call (password) only runs into
+//      a tab that is still clean.
+//   4. Routes through chromeInputType (CDP path) — never chrome_set_native_value. Typing is
+//      the safe path here because the form is mid-flow and the value should look like real
+//      keystrokes to whatever password manager / autofill detector the page is using.
+async function credentialsFillInTab(params) {
+  const step = params && typeof params.step === "string" ? params.step : "";
+  const host = params && typeof params.host === "string" ? params.host.toLowerCase() : "";
+  const value = params && typeof params.value === "string" ? params.value : "";
+  const targetId = params && params.targetId !== undefined ? Number(params.targetId) : undefined;
+  if (step !== "username" && step !== "password") {
+    throw new Error(`credentials.fill: step must be 'username' or 'password' (got '${step}')`);
+  }
+  if (!host) throw new Error("credentials.fill: host is required");
+  if (!value) throw new Error("credentials.fill: value is required");
+
+  // Resolve the tab by explicit targetId or urlIncludes. credentials.fill must NEVER fall back
+  // to creating a fresh automation target — we need a real URL to validate the host guard.
+  let tab;
+  if (targetId !== undefined && !Number.isNaN(targetId)) {
+    tab = await chrome.tabs.get(targetId).catch(() => null);
+  } else if (params.urlIncludes) {
+    const tabs = await chrome.tabs.query({});
+    tab = tabs.find((t) => (t.url || "").includes(params.urlIncludes)) || null;
+  }
+  if (!tab || typeof tab.id !== "number") {
+    throw new Error("credentials.fill: target tab not found; pass targetId or urlIncludes explicitly");
+  }
+
+  // Cross-host guard (re-checked on the worker side). A stale URL between Node probe and our
+  // dispatch would otherwise let the password leak to whatever the user navigated to.
+  const currentHost = (() => {
+    try { return new URL(tab.url || "").hostname.toLowerCase(); } catch { return ""; }
+  })();
+  if (currentHost !== host) {
+    throw new Error(`credentials.fill: cross-host guard — expected host '${host}', active tab is '${currentHost || "(none)"}'`);
+  }
+
+  // MFA / CAPTCHA re-check on the first step. If a 2FA prompt appeared between the Node probe
+  // and now, bail before typing anything; never type the password into a post-MFA page.
+  if (step === "username") {
+    const probe = await executeInTab({ targetId: tab.id, background: false }, probeLoginChallenges, []);
+    if (probe && probe.hasTotpField) {
+      throw new Error("credentials.fill: detected a TOTP/2FA field on the page; refusing to auto-fill. Ask the user to complete 2FA manually.");
+    }
+    if (probe && probe.captchaIframes > 0) {
+      throw new Error("credentials.fill: detected a CAPTCHA iframe (hCaptcha/reCAPTCHA); refusing to auto-fill. Ask the user to solve the challenge.");
+    }
+  }
+
+  // Drive chromeInputType directly. We pass the value as `text` and the optional uid/selector
+  // through verbatim; chromeInputType already does the focus-by-click + CDP key dispatch path.
+  const typeParams = {
+    targetId: tab.id,
+    text: value,
+    background: false,
+    ...(params.uid ? { uid: String(params.uid) } : {}),
+    ...(params.selector ? { selector: String(params.selector) } : {}),
+  };
+  const typing = await chromeInputType(typeParams);
+  return { ok: true, step, host, valueLength: value.length, typing };
+}
+
+// Helper for credentials.fill: detect login challenges the Node side has to short-circuit on.
+// Run in MAIN world via executeInTab. Kept tiny so the worker can serialize it by toString().
+function probeLoginChallenges() {
+  const totpHints = ["totp", "2fa", "mfa", "verification", "authenticator", "otp", "one-time"];
+  const hasTotpField = Array.from(document.querySelectorAll("input")).some((el) => {
+    if (!el || el.type === "hidden") return false;
+    const blob = [
+      el.id || "", el.name || "", el.autocomplete || "", el.placeholder || "",
+      (el.getAttribute("aria-label") || ""), (el.getAttribute("data-testid") || ""),
+    ].join(" ").toLowerCase();
+    return totpHints.some((hint) => blob.includes(hint));
+  });
+  const captchaIframes = Array.from(document.querySelectorAll("iframe")).filter((f) => {
+    const src = (f.src || "").toLowerCase();
+    return /hcaptcha|recaptcha/.test(src);
+  }).length;
+  return { hasTotpField, captchaIframes };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -1525,7 +2563,7 @@ async function dispatch(action, params) {
         extensionVersion: chrome.runtime.getManifest().version,
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
-        capabilities: { hardBackground: true },
+        capabilities: { hardBackground: true, health: true },
       };
     case "tab.list": {
       const tabs = await chrome.tabs.query({});
@@ -1586,6 +2624,8 @@ async function dispatch(action, params) {
       return inspectInTab(params);
     case "page.evaluate":
       return evaluateInTab(params);
+    case "page.click.retry":
+      return withOptionalSnapshot(params, chromeInputClickRetry);
     case "page.click":
       return withOptionalSnapshot(params, chromeInputClick);
     case "page.hover":
@@ -1596,6 +2636,12 @@ async function dispatch(action, params) {
       return chromeInputUpload(params);
     case "page.type":
       return withOptionalSnapshot(params, chromeInputType);
+    case "page.setValue":
+      return withOptionalSnapshot(params, chromeInputSetValue);
+    case "page.setNativeValue":
+      return withOptionalSnapshot(params, chromeInputSetNativeValue);
+    case "page.sessionCheck":
+      return withOptionalSnapshot(params, probeSessionInTab);
     case "page.fill":
       return withOptionalSnapshot(params, chromeInputFill);
     case "page.key":
@@ -1615,27 +2661,103 @@ async function dispatch(action, params) {
     case "page.network.get":
       return executeInTab(params, getNetworkRequest, [params.requestId]);
     case "page.waitFor": {
-      // Poll from the service worker via CDP (bypasses CSP). The old approach ran the polling
-      // loop in-page with new Function() for expression checks, which fails under strict CSP.
+      // Poll from the service worker via CDP (bypasses CSP). State machine:
+      //   1. Resolve selector/expression each iteration.
+      //   2. If selector: filter by visibility (offsetParent != null && opacity > 0 &&
+      //      display != 'none' && visibility != 'hidden').
+      //   3. Apply waitForSelectorCount floor (default 1).
+      //   4. If waitForStable > 0: after first visible match, snapshot rect+opacity across
+      //      2 RAFs + waitForStable ms; require equality before reporting found.
+      // Returns { found, elapsedMs, polls, stableFor?, visibleAt?, matchCount? }.
       const tab = await getTabByParams(params);
       await bringToFront(tab, params);
       const timeoutMs = params.timeoutMs || 10000;
       const intervalMs = params.intervalMs || 250;
+      const waitForVisible = params.waitForVisible !== false;
+      const waitForStable = params.waitForStable || 0;
+      const waitForSelectorCount = params.waitForSelectorCount || 1;
       const started = Date.now();
+      let polls = 0;
+      let visibleAt = 0;
+      let lastMatchCount = 0;
+
+      // Build a CSP-safe async expression. Each call returns one of:
+      //   - kind=selector: { count, stable } after visibility/stability filtering
+      //   - kind=expression: true/false truthiness
+      // The expression avoids eval/new Function; only DOM + Promise APIs are used.
+      const buildSelectorProbe = (selector) => `(async () => {
+        const __sel = ${JSON.stringify(selector)};
+        const __requireVisible = ${waitForVisible};
+        const __requireStable = ${waitForStable};
+        const __raf = (cb) => (typeof requestAnimationFrame === "function"
+          ? new Promise((r) => requestAnimationFrame(() => r()))
+          : new Promise((r) => setTimeout(r, 16))).then(cb);
+        const __visible = (el) => {
+          if (!el) return false;
+          if (el.offsetParent === null) return false;
+          const s = getComputedStyle(el);
+          if (s.visibility === "hidden" || s.display === "none") return false;
+          if (parseFloat(s.opacity || "1") <= 0) return false;
+          return true;
+        };
+        const __sample = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return { l: Math.round(r.left*100)/100, t: Math.round(r.top*100)/100,
+                   w: Math.round(r.width*100)/100, h: Math.round(r.height*100)/100,
+                   o: s.opacity, v: s.visibility, d: s.display };
+        };
+        const all = Array.from(document.querySelectorAll(__sel));
+        const matches = __requireVisible ? all.filter(__visible) : all;
+        if (matches.length === 0) return { count: 0, stable: false };
+        if (__requireStable <= 0) return { count: matches.length, stable: true };
+        const a = __sample(matches[0]);
+        await __raf(() => undefined);
+        const b = __sample(matches[0]);
+        await __raf(() => undefined);
+        const c = __sample(matches[0]);
+        await new Promise((r) => setTimeout(r, __requireStable));
+        const d = __sample(matches[0]);
+        const eq = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+        return { count: matches.length, stable: eq(a,b) && eq(b,c) && eq(c,d) };
+      })()`;
+
+      const buildExpressionProbe = (value) => `(async () => Boolean((${value})))()`;
+
       while (Date.now() - started < timeoutMs) {
-        let ok = false;
+        polls++;
         try {
-          const expr = params.kind === "selector"
-            ? `!!document.querySelector(${JSON.stringify(params.value)})`
-            : params.value;
-          ok = Boolean(await evaluateInTab({ ...params, expression: expr, foreground: false }));
+          const probe = params.kind === "selector"
+            ? buildSelectorProbe(params.value)
+            : buildExpressionProbe(params.value);
+          const result = await evaluateInTab({ ...params, expression: probe, foreground: false });
+          if (params.kind === "selector") {
+            const r = (result && typeof result === "object") ? result : { count: 0, stable: false };
+            lastMatchCount = r.count || 0;
+            if (r.count >= waitForSelectorCount && r.stable) {
+              if (!visibleAt) visibleAt = Date.now() - started;
+              return {
+                found: true,
+                elapsedMs: Date.now() - started,
+                polls,
+                stableFor: waitForStable > 0 ? waitForStable : undefined,
+                visibleAt: waitForStable > 0 ? visibleAt : undefined,
+                matchCount: lastMatchCount,
+              };
+            }
+          } else {
+            if (result) {
+              return { found: true, elapsedMs: Date.now() - started, polls };
+            }
+          }
         } catch {
-          ok = false;
+          // Swallow per-poll errors; keep polling until timeout.
         }
-        if (ok) return { elapsedMs: Date.now() - started };
+        // Throttle polling — never run a tight loop; an absent sleep would burn CPU
+        // and saturate the bridge with evaluateInTab calls.
         await sleep(intervalMs);
       }
-      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${params.kind}: ${params.value}`);
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${params.kind}: ${params.value} (polls=${polls}, matchCount=${lastMatchCount})`);
     }
     case "page.probe":
       // Lightweight capability probe for /chrome-doctor. Runs in MAIN world.
@@ -1668,6 +2790,14 @@ async function dispatch(action, params) {
       // Close recorded creations, and only ungroup user tabs still in their adopted group.
       // Group titles are not ownership evidence.
       return cleanupSessionTabs(sessionKeyOf(params));
+    case "credentials.fill":
+      // Node-side helper that types a single value (username or password) into a login
+      // form via chromeInputType. The Node side has already validated the alias host,
+      // decrypted the credential, and detected MFA/CAPTCHA — we re-check the hostname
+      // here as a defense-in-depth so a stale wire call can't fill on a tab the user
+      // navigated since the Node call began. Two separate wire calls (step=username,
+      // step=password) split one logical fill into two safe per-field dispatches.
+      return credentialsFillInTab(params);
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1903,9 +3033,22 @@ async function evaluateInTab(params) {
 
 async function withOptionalSnapshot(params, actionFn) {
   const result = await actionFn(params);
-  if (params.includeSnapshot) {
-    const snapshot = await snapshotInTab({ ...params, foreground: false });
-    return { result, snapshot };
+  const include = params.includeSnapshot;
+  if (include === true || include === "auto") {
+    // "auto" — only fetch a snapshot when the action produced a meaningful result.
+    // For waitFor-style results, that means found=true (elapsedMs > 0). For shape {found, ...}
+    // we treat absent found as truthy-neutral; for non-shape results we always snapshot when
+    // include=true.
+    let shouldSnapshot = true;
+    if (include === "auto") {
+      const r = (result && typeof result === "object") ? result : null;
+      if (r && "found" in r) shouldSnapshot = r.found === true;
+      else if (r && "elapsedMs" in r) shouldSnapshot = Number(r.elapsedMs) > 0;
+    }
+    if (shouldSnapshot) {
+      const snapshot = await snapshotInTab({ ...params, foreground: false });
+      return { result, snapshot };
+    }
   }
   return result;
 }
@@ -2795,6 +3938,35 @@ function setNativeValue(element, value) {
   const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
   if (descriptor?.set) descriptor.set.call(element, value);
   else element.value = value;
+}
+
+// React-controlled inputs ignore direct value assignments: React tracks the displayed value
+// via its internal state and snaps the DOM back on the next render. The fix is to (a) write
+// through the native value setter so React's onChange sees a real input transition and (b)
+// dispatch input + change events in the shape React's synthetic event system listens for.
+// detectReactControlled returns true when the element carries a React fiber/props key — the
+// same marker React 16+ installs on every host node. reactCompatFill is the single helper
+// the CDP fill path and the DOM fallback both call into to actually apply the value.
+function detectReactControlled(el) {
+  if (!el || typeof el !== "object") return false;
+  for (const key of Object.keys(el)) {
+    if (key.startsWith("__reactFiber$") || key.startsWith("__reactProps$") || key.startsWith("__reactInternalInstance$")) return true;
+  }
+  return false;
+}
+
+function reactCompatFill(el, value) {
+  if (!el) return { usedReact: false, valueMatches: false };
+  const isReact = detectReactControlled(el);
+  if ("value" in el) {
+    setNativeValue(el, value);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  } else if (el.isContentEditable) {
+    el.textContent = value;
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+  }
+  return { usedReact: isReact, valueMatches: "value" in el ? el.value === value : el.textContent === value };
 }
 
 function printableKeyCode(ch) {

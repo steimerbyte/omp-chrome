@@ -290,6 +290,37 @@
     };
   }
 
+  // Detect Bootstrap / react-bootstrap toggle elements so chrome_click can dispatch a real
+  // synthetic click via el.click() instead of CDP mousePressed — react-bootstrap listens to
+  // bubbling 'click' and does not respond to programmatic Input.dispatchMouseEvent.
+  // Detection rules per ARCHITECTURE-v2.md §2 (A2):
+  //   1. a.nav-link[data-bs-toggle="tab|pill"]                          -> "bootstrap-nav-link"
+  //   2. a.nav-link[data-rb-event-key]                                  -> "react-bootstrap-tab"
+  //   3. button[data-bs-toggle="tab|collapse|dropdown"]                 -> "button"
+  //   4. else                                                           -> null
+  // Returns ToggleInfo or null. Safe to call on any element.
+  function inspectToggleTarget(el) {
+    if (!el || !el.tagName) return null;
+    const tag = el.tagName.toLowerCase();
+    const bsToggle = (el.getAttribute && el.getAttribute("data-bs-toggle")) || "";
+    const rbKey = (el.getAttribute && el.getAttribute("data-rb-event-key")) || null;
+    if (tag === "a" && el.classList && el.classList.contains("nav-link")) {
+      if (bsToggle === "tab" || bsToggle === "pill") {
+        const tabPaneSelector = rbKey ? `.tab-pane[data-rb-event-key="${rbKey}"], .tab-pane[id="${cssEscape(rbKey)}"], [role="tabpanel"][aria-labelledby="${cssEscape(rbKey)}"]` : null;
+        return { kind: "bootstrap-nav-link", rbEventKey: rbKey, tabPaneSelector };
+      }
+      if (rbKey) {
+        const tabPaneSelector = `.tab-pane[data-rb-event-key="${rbKey}"], .tab-pane[id="${cssEscape(rbKey)}"], [role="tabpanel"][aria-labelledby="${cssEscape(rbKey)}"]`;
+        return { kind: "react-bootstrap-tab", rbEventKey: rbKey, tabPaneSelector };
+      }
+    }
+    if (tag === "button" && (bsToggle === "tab" || bsToggle === "collapse" || bsToggle === "dropdown")) {
+      const tabPaneSelector = rbKey ? `.tab-pane[data-rb-event-key="${rbKey}"], .tab-pane[id="${cssEscape(rbKey)}"], [role="tabpanel"][aria-labelledby="${cssEscape(rbKey)}"]` : null;
+      return { kind: "button", rbEventKey: rbKey, tabPaneSelector };
+    }
+    return null;
+  }
+
   function summarizeElement(element, index) {
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
@@ -302,6 +333,12 @@
     const sensitive = isSensitiveField(element);
     const value = rawValue && !sensitive ? rawValue.slice(0, 120) : undefined;
     const checked = "checked" in element ? Boolean(element.checked) : undefined;
+    const toggleInfo = inspectToggleTarget(element);
+    const toggle = toggleInfo ? {
+      kind: toggleInfo.kind,
+      rbEventKey: toggleInfo.rbEventKey || undefined,
+      tabPane: toggleInfo.tabPaneSelector || undefined,
+    } : undefined;
     return {
       index,
       uid: rememberElement(element),
@@ -320,6 +357,7 @@
       inert: Boolean(element.closest?.("[inert]")),
       pointerEvents: style.pointerEvents,
       occluded: occluded || undefined,
+      toggle,
       context: contextForElement(element),
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
     };
@@ -674,4 +712,65 @@
 
   globalThis.__piChromeSnapshotPage = snapshotPage;
   globalThis.__piChromeInspectTarget = inspectTarget;
+  globalThis.__piChromeInspectToggleTarget = inspectToggleTarget;
+
+  // Stability probe used by chrome_wait_for (Cluster B): samples rect + opacity across two
+  // requestAnimationFrame ticks plus `stableMs` of real time, returning true only when both
+  // samples are deep-equal. Falls back to setTimeout when rAF is unavailable (CDP-attached
+  // backgrounds occasionally have no compositor). Self-contained so it serializes cleanly
+  // through chrome.scripting.executeScript({ func: ... }).
+  function isElementStable(el, stableMs) {
+    return (async () => {
+      if (!el || !el.getBoundingClientRect) return false;
+      const sample = () => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return {
+          left: Math.round(rect.left * 100) / 100,
+          top: Math.round(rect.top * 100) / 100,
+          width: Math.round(rect.width * 100) / 100,
+          height: Math.round(rect.height * 100) / 100,
+          opacity: style.opacity,
+          visibility: style.visibility,
+          display: style.display,
+        };
+      };
+      const raf = (cb) => (typeof requestAnimationFrame === "function"
+        ? new Promise((r) => requestAnimationFrame(() => r()))
+        : new Promise((r) => setTimeout(r, 16))).then(cb);
+      await raf(() => undefined);
+      const first = sample();
+      await raf(() => undefined);
+      const second = sample();
+      await new Promise((r) => setTimeout(r, stableMs || 0));
+      const third = sample();
+      const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      return eq(first, second) && eq(second, third);
+    })();
+  }
+
+  // Counts selector matches that satisfy `predicate`, then verifies stability across `stableMs`
+  // when stableMs > 0. Returns `{ count, stable }` so the caller can decide whether to keep
+  // polling. Self-contained func expression form so it can be embedded via toString() into the
+  // page.waitFor state machine evaluated through CDP Runtime.evaluate.
+  function countMatchesStable(selector, predicate, stableMs) {
+    return (async () => {
+      const all = Array.from(document.querySelectorAll(selector));
+      const visible = all.filter((el) => {
+        if (el.offsetParent === null) return false;
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none") return false;
+        if (parseFloat(style.opacity || "1") <= 0) return false;
+        return predicate ? predicate(el) : true;
+      });
+      if (!stableMs || visible.length === 0) return { count: visible.length, stable: stableMs ? false : true };
+      // Stability is checked against the first visible match; we only need one sample
+      // element to confirm the resolved set has settled.
+      const stable = await isElementStable(visible[0], stableMs);
+      return { count: visible.length, stable };
+    })();
+  }
+
+  globalThis.__piChromeIsElementStable = isElementStable;
+  globalThis.__piChromeCountMatchesStable = countMatchesStable;
 })();

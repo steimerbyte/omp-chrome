@@ -105,6 +105,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         set: async (obj) => { Object.assign(storage, obj); },
       },
     } : undefined,
+    alarms: { onAlarm: { addListener: () => {} }, create: () => {}, clear: () => {}, clearAll: () => {} },
   };
 
   if (withTabGroups) {

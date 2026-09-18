@@ -41,8 +41,17 @@ const pageGlobals = {
   document: {
     title: "page title",
     _present: new Set(),
-    querySelector(sel) { return this._present.has(sel) ? { sel } : null; },
+    querySelector(sel) { return this._present.has(sel) ? this._mkEl() : null; },
+    querySelectorAll(sel) { return this._present.has(sel) ? [this._mkEl()] : []; },
+    _mkEl() {
+      return {
+        offsetParent: {}, // simulate a visible element (page.waitFor visibility filter)
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 1, height: 1, right: 1, bottom: 1, x: 0, y: 0 }),
+      };
+    },
   },
+  getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+  requestAnimationFrame: (cb) => setTimeout(cb, 0),
 };
 pageGlobals.window = pageGlobals;
 pageGlobals.globalThis = pageGlobals;

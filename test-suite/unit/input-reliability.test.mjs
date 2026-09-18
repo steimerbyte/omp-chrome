@@ -31,6 +31,7 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     getSelection: () => selection,
     location: { href: "https://fixture.test/" },
     __PI_CHROME_STATE__: { elements: { "el-1": element } },
+    getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1", position: "static" }),
   });
   page.window = page;
   const listener = { addListener() {}, removeListener() {} };
